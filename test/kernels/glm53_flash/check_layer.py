@@ -992,21 +992,23 @@ def check_embed(args, rank, tp, group, device) -> bool:
     embedding rows (x = the row on every rank; post 1, comb 0, residual 0) on the same
     weights and state: outputs and state writes bitwise equal, the width's rows past
     the step's pads; and the step tables it writes equal the spec's torch tables."""
-    from msgspec.structs import astuple
+
+    def decode_state(s):
+        return (s.conv_state, s.rec_state)
 
     rt, launches, _, ins = build(args, "embed", rank, tp, group, device)
     op, kw = launches[0]
     step = kw["step"]
     n = step["ids"].shape[0]
     _, table = embedding(rank, tp, device)
-    state0 = [t.clone() for t in astuple(kw["state"])]
+    state0 = [t.clone() for t in decode_state(kw["state"])]
     out = [t.clone() for t in op.launch(*ins, **kw)]
     torch.cuda.synchronize()
     kda, rows = spec_tables(step, kw["state_idx"], args.rows)
     tables = torch.equal(step["slots"], kda) and torch.equal(step["rows"], rows)
     ref_rt, ref_launches, _, _ = build(args, "dense", rank, tp, group, device)
     ref_op, ref_kw = ref_launches[0]
-    for t, v in zip(astuple(ref_kw["state"]), state0):
+    for t, v in zip(decode_state(ref_kw["state"]), state0):
         t.copy_(v)
     x = torch.zeros(args.rows, HIDDEN, dtype=torch.bfloat16, device=device)
     x[:n] = table[step["ids"]]
@@ -1015,7 +1017,7 @@ def check_embed(args, rank, tp, group, device) -> bool:
     same = all(torch.equal(a, b) for a, b in zip(out, ref))
     writes = all(
         torch.equal(a, b)
-        for a, b in zip(astuple(kw["state"]), astuple(ref_kw["state"]))
+        for a, b in zip(decode_state(kw["state"]), decode_state(ref_kw["state"]))
     )
     print(
         f"rank {rank}: {n} of {args.rows} rows from the tokens == the dense launch on "
