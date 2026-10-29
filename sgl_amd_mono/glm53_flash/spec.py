@@ -56,7 +56,10 @@ from sgl_amd_mono.glm53_flash import (
 )
 
 # kernel widths; a step of fewer rows runs at the next width, the rest pad rows
-WIDTHS = (2, 4, 8)
+# (12: two MTP5 or three MTP3 requests)
+WIDTHS = (2, 4, 8, 12, 16)
+# above this width the MoE runs expert-major (``FlashBuild.grouped``)
+GROUPED_FROM = 9
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (2, 4, 8)
 # the rows a step runs on the kernels at most at this TP size: at TP2 a sparse-
@@ -887,6 +890,7 @@ def _build(model, hf_config, ctx) -> _Built:
                 dense_shuffled=dense_sh if kind in ("dense", "embed") else False,
                 tokens=kind == "embed",
                 verify=verify,
+                grouped=w >= GROUPED_FROM and kind not in ("dense", "embed"),
                 fault_site=fault_site,
                 fault_after=fault_after,
             )

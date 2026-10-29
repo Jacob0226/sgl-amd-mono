@@ -96,7 +96,9 @@ def _plan(rows, tokens=1):
 
 def test_a_step_runs_at_the_next_width_and_tp2_takes_four_rows():
     # a step of fewer rows than a width runs at the next width, the rest pad rows
-    assert [flash._width(r) for r in flash.ROWS] == [2, 2, 4, 4, 8, 8, 8, 8]
+    assert [flash._width(r) for r in flash.ROWS] == [2, 2, 4, 4] + [8] * 4 + [
+        12
+    ] * 4 + [16] * 4
     # TP2 builds no 8-row launch: a wider step runs the model's own forward
     lm, built = _built(tp=2, widths=(2, 4))
     out = built.forward(_plan(8), "ids", "positions", "batch")

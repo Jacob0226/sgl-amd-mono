@@ -806,6 +806,7 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
         dense_shuffled=shuffled and dense,
         tokens=kind == "embed",
         head=kind == "head",
+        grouped=args.rows > 8 and not dense and kind != "head",
         stop=False,
     )
     rt = FlashRuntime(key, rank, group, device)
@@ -1132,6 +1133,7 @@ def check_verify(args, rank, tp, group, device) -> bool:
             dsa=not kda,
             max_pools=0 if kda else args.max_pools,
             verify=verify,
+            grouped=rows > 8,
             stop=False,
         )
         rt = FlashRuntime(key, rank, group, device)
