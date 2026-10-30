@@ -3013,7 +3013,9 @@ def build_flash_kernel(key: FlashBuild):
                 ksc = ld_f32(r_blk, IPB * INDEX_DIM // 4 + off_of(pw))
                 return pw, kw, ksc
 
-            def score_half(s, n_pools, loaded):
+            def score_half(s, n_pools, loaded, q_off, w_off):
+                """Row ``s``'s scores of a loaded tile half: its FP8 query at LDS word
+                ``q_off``, its head weights at ``w_off``."""
                 pw, kw, ksc = loaded
                 a = fx.Vector.from_elements(
                     [kw[h][e] for h in range(2) for e in range(4)], fx.Int32
@@ -3024,7 +3026,8 @@ def build_flash_kernel(key: FlashBuild):
                     qb = [
                         fx.Vector(
                             fx.ptr_load(
-                                xs + (hq * QW8 + 8 * g4 + 4 * h), result_type=v4f
+                                xs + (q_off + hq * QW8 + 8 * g4 + 4 * h),
+                                result_type=v4f,
                             )
                         ).bitcast(fx.Int32)
                         for h in range(2)
@@ -3049,7 +3052,7 @@ def build_flash_kernel(key: FlashBuild):
                         )
                     )
                     # C[pool][head] in lane head + 16 (pool // 4), elem pool % 4
-                    w_h = lds_ld(misc, hq)
+                    w_h = lds_ld(xs, w_off + hq)
                     for e in range_constexpr(4):
                         parts[e] = parts[e] + fx.max(c[e], fx.Float32(0.0)) * w_h
                 for off in (1, 2, 4, 8):
@@ -3070,54 +3073,90 @@ def build_flash_kernel(key: FlashBuild):
                     cache_modifier=CM_DEV,
                 )
 
-            for s in range_constexpr(S):
-                pos = row_word(s, ROW_POS)
-                bound, scored, _ = row_keys(pos)
-                n_pools = scored.select(bound, fx.Int32(0))
+            # a task a (unit, tile): a unit is a verify request's rows, which share its
+            # page table (SGLang repeats the request's row) and so each tile's keys,
+            # or one other row. A tile's keys load once for the unit's rows; each row
+            # scores them with its own query and weights, masked to its own pools
+            # (pools past a row's are a later row's, loaded in place).
+            if const_expr(VERIFY):
+                UNITS = [list(range(r * VL, (r + 1) * VL)) for r in range(NREQ)]
+                UNITS += [[s] for s in range(NREQ * VL, S)]
+            else:
+                UNITS = [[s] for s in range(S)]
+            NQW = INDEX_HEADS * QW8 // THREADS
+            for u in range_constexpr(len(UNITS)):
+                urows = UNITS[u]
+                UL = len(urows)
+                row_pools = []
+                for s in urows:
+                    bound, scored, _ = row_keys(row_word(s, ROW_POS))
+                    row_pools.append(scored.select(bound, fx.Int32(0)))
+                n_pools = row_pools[0]
+                for v in row_pools[1:]:
+                    n_pools = fx.max(n_pools, v)
                 n_tiles = (n_pools + POOLS_PER_TASK - 1) // POOLS_PER_TASK
-                first = start_at(base["iscore"] + s * (G // S))
+                first = start_at(base["iscore"] + u * (G // len(UNITS)))
                 if first < n_tiles:
-                    bt = row_word(s, ROW_BT)
+                    bt = row_word(urows[0], ROW_BT)
                     r_ibt = _rsrc(
                         page_table + fx.Int64(bt) * fx.Int64(pt_stride) * fx.Int64(4)
                     )
                     # the first tile's block-table entries load while one lane polls
-                    # the cache's flag (the pool this launch completed), then its keys
-                    # load while the query is awaited
+                    # the cache's flags (the pools this launch completed), then its
+                    # keys load while the queries are awaited
                     blocks = [
                         half_block(r_ibt, n_pools, first, h) for h in range(HALVES)
                     ]
                     if tid == 0:
-                        for r in chain_rows(s):
+                        for r in chain_rows(urows[-1]):
                             get(mb("kv_ready"), r)
                     fx.memory_fence(
                         ordering=fx.AtomicOrdering.Acquire, syncscope="agent"
                     )
                     gpu.barrier()
                     pre = [load_half(n_pools, b) for b in blocks]
-                    # the row's FP8 query -> LDS words h * 32 .., weights -> misc
-                    NQW = INDEX_HEADS * QW8 // THREADS
-                    qv = poll(
-                        [
-                            (mb("iq8"), s * INDEX_HEADS * QW8 + tid + i * THREADS, 1)
-                            for i in range(NQW)
-                        ]
+                    # the rows' FP8 queries -> LDS words i * Q_ROW + h * 32 .., their
+                    # weights -> words W_OFF + i * INDEX_HEADS + h, in one poll
+                    Q_ROW = INDEX_HEADS * QW8
+                    W_OFF = UL * Q_ROW
+                    assert W_OFF + UL * INDEX_HEADS <= MISC_OFF
+                    q0 = urows[0] * Q_ROW
+                    specs = [
+                        (mb("iq8"), q0 + tid + i * THREADS, 1)
+                        for i in range(UL * NQW)
+                    ]
+                    specs.append(
+                        (
+                            mb("iqw"),
+                            urows[0] * INDEX_HEADS
+                            + fx.min(tid, fx.Int32(UL * INDEX_HEADS - 1)),
+                            1,
+                        )
                     )
-                    for i in range_constexpr(NQW):
+                    qv = poll(specs, batch=len(specs))
+                    for i in range_constexpr(UL * NQW):
                         lds_st(xs, tid + i * THREADS, qv[i][0].bitcast(fx.Float32))
-                    if tid < INDEX_HEADS:
-                        hw = getf_many([(mb("iqw"), s * INDEX_HEADS + tid)])[0]
-                        lds_st(misc, tid, hw)
+                    if tid < UL * INDEX_HEADS:
+                        lds_st(xs, W_OFF + tid, qv[-1][0].bitcast(fx.Float32))
                     gpu.barrier()
+
+                    def score_tile(loaded):
+                        for i in range_constexpr(UL):
+                            score_half(
+                                urows[i],
+                                row_pools[i],
+                                loaded,
+                                i * Q_ROW,
+                                W_OFF + i * INDEX_HEADS,
+                            )
+
                     for h in range_constexpr(HALVES):
-                        score_half(s, n_pools, pre[h])
+                        score_tile(pre[h])
                     for tile in range(first + G, n_tiles, G):
                         tile = fx.Int32(tile)
                         for h in range_constexpr(HALVES):
-                            score_half(
-                                s,
-                                n_pools,
-                                load_half(n_pools, half_block(r_ibt, n_pools, tile, h)),
+                            score_tile(
+                                load_half(n_pools, half_block(r_ibt, n_pools, tile, h))
                             )
                     gpu.barrier()
 
