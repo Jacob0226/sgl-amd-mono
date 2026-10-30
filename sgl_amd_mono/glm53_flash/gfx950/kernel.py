@@ -209,7 +209,7 @@ SORT5 = ((0, 1), (3, 4), (2, 4), (2, 3), (0, 3), (0, 2), (1, 4), (1, 3), (1, 2))
 # maximum is (RANK_BASE - rank) << ID_BITS | id
 RANK_BASE = 2047
 ID_BITS = 9
-TL_POINTS = 16
+TL_POINTS = 24
 assert N_EXPERTS < 1 << ID_BITS and ROUTER_CANDIDATES == 5
 
 
@@ -286,9 +286,10 @@ class FlashBuild(msgspec.Struct, frozen=True):
     # the expert-major MoE (not with dense or head): a task an expert's 16 picks, up
     # to 64 rows
     grouped: bool = False
-    # with dsa: s_memrealtime (100 MHz) of each CTA's thread 0 at the layer's start,
-    # after each attention stage and around the FFN, to scratch "tl" (int64
-    # [BLOCKS, TL_POINTS])
+    # s_memrealtime (100 MHz) of each CTA's thread 0 at the layer's start, after each
+    # sparse-attention stage and each FFN stage, to scratch "tl" (int64
+    # [BLOCKS, TL_POINTS]); 0 start, 1-13 attention, 14 gate, 16 router, 20 shared
+    # (per-row), 17 route, 18 up/gate, 19 down (grouped), 15 end
     timeline: bool = False
 
 
@@ -372,7 +373,7 @@ def build_flash_kernel(key: FlashBuild):
     SC, SY = layout(
         S, W, expert_inter, kda, dsa, max_pools, dense, head, tokens, GROUPED
     )
-    TIMELINE = key.timeline and dsa
+    TIMELINE = key.timeline
     if TIMELINE:
         SC = {**SC, "tl": SC["_bytes"], "_bytes": SC["_bytes"] + G * TL_POINTS * 8}
     # producers of each box: the gates' rows and the kda heads
@@ -4226,6 +4227,7 @@ def build_flash_kernel(key: FlashBuild):
             run_dsa()
             run_seam("seam", "ffn_own")
         else:
+            tl_stamp(0)
             run_seam("seam", "ffn")
         run_gate("gate", "ffn")
         tl_stamp(14)
@@ -4420,6 +4422,7 @@ def build_flash_kernel(key: FlashBuild):
                     _rcp(1.0 + _exp(-logit)),
                 )
             gpu.barrier()
+        tl_stamp(16)
 
         def dn_route(bs):
             """Expert routing: one whole wave per sample, in wave-sized batches.
@@ -4513,6 +4516,7 @@ def build_flash_kernel(key: FlashBuild):
                 lds_st(rti, RT_PICK + lds_ld(rti, RT_POFF + e) + below, tid)
             gpu.barrier()
             n_units = _uniform(lds_ld(rti, RT_N))
+            tl_stamp(17)
 
             def unit(u):
                 """Unit u's (expert, rows, first pick)."""
@@ -4637,6 +4641,7 @@ def build_flash_kernel(key: FlashBuild):
                         put(mb("sel"), p, lds_ld(keys, p))
                         put(mb("prob"), p, lds_ld(dnw, p))
 
+            tl_stamp(18)
             # ---- down: a wave RGW row groups of every K unit of its picks' mid
             DN_NK = expert_inter // 128
             RGW = max(1, 16 // DN_NK)
@@ -4714,6 +4719,7 @@ def build_flash_kernel(key: FlashBuild):
                         put2(mb("dpart"), o, acc[0], acc[1])
                         put2(mb("dpart"), o + 2, acc[2], acc[3])
 
+            tl_stamp(19)
             # ---- sum: 16 hidden rows of every row, slots in order, route-weighted
             ST = GROUPED_SUM_TILE
 
@@ -4833,8 +4839,10 @@ def build_flash_kernel(key: FlashBuild):
             if (u == 0) & (tid < S):
                 put(mb("sel"), tid * MOE_SLOTS, fx.Int32(SHARED))
                 put(mb("prob"), tid * MOE_SLOTS, fx.Float32(1.0))
+        tl_stamp(20)
         dn_route(bias_c)
         gpu.barrier()
+        tl_stamp(17)
 
         # routed: task t is slot 1 + t / (2 N_UG_C), 32-value chunk (t / 2) % N_UG_C, rows
         # of half t % 2. A wave takes 4 K units of the 4 row groups of every row; a row's
@@ -4964,6 +4972,7 @@ def build_flash_kernel(key: FlashBuild):
                             lds_ld(dnw, s * MOE_SLOTS + slot),
                         )
 
+        tl_stamp(18)
         # ======== 4. mid MXFP8 quant + expert down + route weighting + MoE TP reduce
         DN_R = (DN_TILE + 15) // 16
         DN_WPR = WAVES // DN_R
