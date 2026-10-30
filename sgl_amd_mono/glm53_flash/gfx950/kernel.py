@@ -53,6 +53,7 @@ from sgl_amd_mono.common.ops import (
     fp8_pack4,
     popcount,
 )
+from sgl_amd_mono.common.ops import clock as mem_realtime
 from sgl_amd_mono.common.ops import fp8_to_bf16x8 as _fp8_to_bf16x8
 from sgl_amd_mono.common.ops import fresh as fresh_i32
 from sgl_amd_mono.common.ops import hw_exp as _exp
@@ -208,6 +209,7 @@ SORT5 = ((0, 1), (3, 4), (2, 4), (2, 3), (0, 3), (0, 2), (1, 4), (1, 3), (1, 2))
 # maximum is (RANK_BASE - rank) << ID_BITS | id
 RANK_BASE = 2047
 ID_BITS = 9
+TL_POINTS = 16
 assert N_EXPERTS < 1 << ID_BITS and ROUTER_CANDIDATES == 5
 
 
@@ -284,6 +286,10 @@ class FlashBuild(msgspec.Struct, frozen=True):
     # the expert-major MoE (not with dense or head): a task an expert's 16 picks, up
     # to 64 rows
     grouped: bool = False
+    # with dsa: s_memrealtime (100 MHz) of each CTA's thread 0 at the layer's start,
+    # after each attention stage and around the FFN, to scratch "tl" (int64
+    # [BLOCKS, TL_POINTS])
+    timeline: bool = False
 
 
 def build_flash_kernel(key: FlashBuild):
@@ -366,6 +372,9 @@ def build_flash_kernel(key: FlashBuild):
     SC, SY = layout(
         S, W, expert_inter, kda, dsa, max_pools, dense, head, tokens, GROUPED
     )
+    TIMELINE = key.timeline and dsa
+    if TIMELINE:
+        SC = {**SC, "tl": SC["_bytes"], "_bytes": SC["_bytes"] + G * TL_POINTS * 8}
     # producers of each box: the gates' rows and the kda heads
     BOXES = {"box_a_in": S, "box_a": S, "box_o_in": S * H}
     assert not kda or S * H % BOX_WORDS == 0
@@ -1217,6 +1226,19 @@ def build_flash_kernel(key: FlashBuild):
 
         def start(name):
             return (bid + (G - base[name])) & (G - 1)
+
+        def tl_stamp(k):
+            if const_expr(TIMELINE):
+                if tid == 0:
+                    fx.generic_store(
+                        fx.inttoptr(
+                            fx.PointerType.get(
+                                fx.Int64.ir_type, fx.AddressSpace.Global, 8
+                            ),
+                            mb("tl") + fx.Int64(bid * TL_POINTS + k) * 8,
+                        ),
+                        mem_realtime(),
+                    )
 
         def n_sel(count=S):
             """This lane's local MFMA B column; inactive columns duplicate the last one."""
@@ -3920,6 +3942,7 @@ def build_flash_kernel(key: FlashBuild):
             )
 
         def run_dsa():
+            tl_stamp(0)
             # the layer's argument table (entry i in lane i): pointers, then int32 geometry
             t32 = {
                 n: fx.Int32(rocdl.readlane(T.i32, tab_words[0], i))
@@ -3932,23 +3955,36 @@ def build_flash_kernel(key: FlashBuild):
             }
             run_seam("aseam", "attn", early_seam)
             run_gate("agate", "attn", early_gate)
+            tl_stamp(1)
             # the step's row table -> LDS, read from the cache stage on (which
             # begins with a barrier)
             if tid < S * ROW_WORDS:
                 lds_st(rows_lds, tid, row_words)
             dsa_qkv_fp8(tv, t32)
             dsa_qkv_bf16(tv, t32)
+            tl_stamp(2)
             dsa_qnorm(tv, t32)
+            tl_stamp(3)
             dsa_cache(tv, t32)
+            tl_stamp(4)
             dsa_q_b(tv, t32)
+            tl_stamp(5)
             dsa_index_q(tv, t32)
+            tl_stamp(6)
             dsa_iq_quant(tv, t32)
+            tl_stamp(7)
             dsa_uk(tv, t32)
+            tl_stamp(8)
             dsa_iscore(tv, t32)
+            tl_stamp(9)
             dsa_iselect(tv, t32)
+            tl_stamp(10)
             dsa_split(tv, t32)
+            tl_stamp(11)
             dsa_uv(tv, t32)
+            tl_stamp(12)
             dsa_oproj(tv, t32)
+            tl_stamp(13)
 
         # ===================== the model's tail: mHC post, stream mean, final norm, LM head
         # hpost: one task a 32-column tile, every row: the four streams as the terminal
@@ -4153,6 +4189,7 @@ def build_flash_kernel(key: FlashBuild):
         else:
             run_seam("seam", "ffn")
         run_gate("gate", "ffn")
+        tl_stamp(14)
         # ======== dense MLP (layers 0-2): FP8 gate | up + clamped SiLU, FP8 down + TP reduce
         # bf16 activations; gate and up rounded to bf16 as SGLang's GEMM stores them, mid
         # rounded to bf16 as its activation stores it
@@ -4677,6 +4714,7 @@ def build_flash_kernel(key: FlashBuild):
 
         if const_expr(GROUPED):
             run_grouped()
+            tl_stamp(15)
             return
         # the shared expert needs only the activation blocks: it runs before the router
         # scores, its weights loading before the gate's flag on CTAs that run no router
@@ -5038,6 +5076,7 @@ def build_flash_kernel(key: FlashBuild):
 
             peer_reduce("ffn", t, store_x, DN_TILE)
             gpu.barrier()
+        tl_stamp(15)
 
     @flyc.jit
     def launch(
