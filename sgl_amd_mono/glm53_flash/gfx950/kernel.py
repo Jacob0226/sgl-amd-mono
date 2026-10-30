@@ -47,7 +47,6 @@ from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol, spin_until
 from sgl_amd_mono.common.ops import (
-    ballot,
     bpermute_i32,
     div_rn,
     fp8_pack4,
@@ -432,7 +431,8 @@ def build_flash_kernel(key: FlashBuild):
     RED_OFF = DNW_OFF + S * MOE_SLOTS
     OUT_OFF = RED_OFF + RED_WORDS
     OUT_WORDS = max(S * ROW_TILE, S * 2 * UG_TILE, S * DN_TILE)
-    # the grouped MoE's route table: each expert's row mask (2 words), pick count and
+    # the grouped MoE's route table (RT_MASK and RT_CNT adjacent, zeroed together):
+    # each expert's row mask (2 words), pick count and
     # first pick, the units (expert | rows - 1 << 9 | first pick << 13) in expert
     # order, the picks (row * MOE_SLOTS + slot) by expert then row, scan sums, units
     NE1 = N_EXPERTS + 1
@@ -4416,23 +4416,21 @@ def build_flash_kernel(key: FlashBuild):
             rti = fx.recast_iter(fx.Int32, xs)
             dn_route(load_bias())
             gpu.barrier()
-            # each expert's row mask: wave w the experts w, w + 8, ..; lane s row s
-            wv = _uniform(wave)
-            row_keys = [
-                lds_ld(keys, fx.min(lane, S - 1) * MOE_SLOTS + k)
-                for k in range(MOE_SLOTS)
-            ]
-            for i in range_constexpr((NE1 + WAVES - 1) // WAVES):
-                e = wv + i * WAVES
-                if e < NE1:
-                    hit = row_keys[0] == e
-                    for k in range_constexpr(1, MOE_SLOTS):
-                        hit = hit | (row_keys[k] == e)
-                    bits = ballot(hit & (lane < S))
-                    if lane == 0:
-                        lds_st(rti, RT_MASK + 2 * e, fx.Int32(bits))
-                        lds_st(rti, RT_MASK + 2 * e + 1, fx.Int32(bits >> 32))
-                        lds_st(rti, RT_CNT + e, popcount(bits))
+            # each expert's row mask and pick count, a thread a pick: a row picks an
+            # expert at most once, so the OR and the count need no order
+            for i in range_constexpr((3 * NE1 + THREADS - 1) // THREADS):
+                if tid + i * THREADS < 3 * NE1:
+                    lds_st(rti, RT_MASK + tid + i * THREADS, fx.Int32(0))
+            gpu.barrier()
+            if tid < S * MOE_SLOTS:
+                e = lds_ld(keys, tid)
+                s = tid // MOE_SLOTS
+                fx.atomic_or(
+                    rti + (RT_MASK + 2 * e + s // 32),
+                    fx.Int32(1) << (s % 32),
+                    syncscope="workgroup",
+                )
+                fx.atomic_add(rti + (RT_CNT + e), fx.Int32(1), syncscope="workgroup")
             gpu.barrier()
             # an exclusive scan of (picks | units << 16) in expert order -> each
             # expert's first pick and its units
