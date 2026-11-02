@@ -138,7 +138,16 @@ def test_the_logits_processor_returns_the_tail_s_logits_on_a_routed_step():
 
 
 def _cfg(**kw):
-    return SimpleNamespace(**{"page_size": 256, "speculative_algorithm": None, **kw})
+    return SimpleNamespace(
+        **{
+            "page_size": 256,
+            "speculative_algorithm": None,
+            "linear_attn_backend": "triton",
+            "linear_attn_decode_backend": None,
+            "linear_attn_verify_backend": None,
+            **kw,
+        }
+    )
 
 
 def _dtypes(temporal=torch.float32, conv=torch.bfloat16):
@@ -209,6 +218,45 @@ def test_mtp_verifies_one_draft_chain(monkeypatch, topk, steps, draft, ok):
     )
     reasons = flash.SPEC.config_disable_reasons(cfg, FLASH)
     assert (reasons == []) == ok, reasons
+
+
+@pytest.mark.parametrize(
+    "spec, backends, ok",
+    [
+        ("EAGLE", {}, True),
+        ("EAGLE", {"linear_attn_verify_backend": "triton"}, True),
+        ("EAGLE", {"linear_attn_verify_backend": "flashinfer"}, False),
+        ("EAGLE", {"linear_attn_decode_backend": "flashinfer"}, False),
+        ("EAGLE", {"linear_attn_backend": "flashinfer"}, False),
+        (
+            "EAGLE",
+            {
+                "linear_attn_decode_backend": "flashinfer",
+                "linear_attn_verify_backend": "triton",
+            },
+            True,
+        ),
+        (None, {"linear_attn_backend": "flashinfer"}, True),
+    ],
+)
+def test_mtp_refuses_the_fused_accept(monkeypatch, spec, backends, ok):
+    # SGLang's FlashInfer KDA verify skips the KDA state commit a verify launch
+    # reads; unset, the verify backend follows a FlashInfer decode backend
+    import sglang.srt.configs.mamba_utils as mamba_utils
+    import sglang.srt.layers.attention.dsa.utils as dsa_utils
+
+    monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", _dtypes())
+    monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: True)
+    cfg = _cfg(
+        speculative_algorithm=spec,
+        speculative_eagle_topk=1,
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        **backends,
+    )
+    reasons = flash.SPEC.config_disable_reasons(cfg, FLASH)
+    assert (reasons == []) == ok, reasons
+    assert ok or "fuses the accept" in reasons[0], reasons
 
 
 def test_the_spec_requires_sglang_jit_grouped_topk_off():
@@ -567,7 +615,9 @@ def _routed_step(monkeypatch, capture=None):
     lm.model = SimpleNamespace(layers=[last], norm=lambda h: h * 2)
     monkeypatch.setattr(check, "contract", lambda streams: streams)
     built = flash._Built(lm, layers, runtimes, {2: _Head(calls)}, tp=4, device="cpu")
-    monkeypatch.setattr(flash._Built, "_bind_kda", staticmethod(lambda L, kda, verify: None))
+    monkeypatch.setattr(
+        flash._Built, "_bind_kda", staticmethod(lambda L, kda, verify: None)
+    )
     monkeypatch.setattr(flash._Built, "_bind_dsa", staticmethod(lambda L, verify: None))
     slots = torch.tensor([5], dtype=torch.int32)
     linear = SimpleNamespace(

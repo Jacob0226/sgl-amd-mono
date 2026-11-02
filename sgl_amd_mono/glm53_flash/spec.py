@@ -81,6 +81,9 @@ SGLANG_READS = {
         "speculative_eagle_topk",
         "speculative_num_steps",
         "speculative_num_draft_tokens",
+        "linear_attn_backend",
+        "linear_attn_decode_backend",
+        "linear_attn_verify_backend",
         "enable_hisparse",
         "expert_distribution_recorder_mode",
         "watchdog_timeout",
@@ -142,7 +145,6 @@ SGLANG_READS = {
         "get_compress_tail_buffers",
     ),
     "srt/model_executor/forward_batch_info.py": (
-        "is_target_verify",
         "out_cache_loc",
         "req_pool_indices",
         "capture_hidden_mode",
@@ -285,6 +287,18 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         or cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
     ):
         reasons.append("MTP verifies one draft chain: topk 1, draft tokens = steps + 1")
+    # SGLang's FlashInfer KDA verify fuses the accept (KDAAttnBackend's
+    # _can_fuse_accept_state): it skips the KDA state commit, which a verify
+    # launch reads. Unset, the verify backend follows a FlashInfer decode backend
+    decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
+    verify = cfg.linear_attn_verify_backend or (
+        "flashinfer" if decode == "flashinfer" else None
+    )
+    if cfg.speculative_algorithm is not None and verify == "flashinfer":
+        reasons.append(
+            "MTP with the FlashInfer KDA verify backend fuses the accept, leaving "
+            "the KDA state a verify launch reads uncommitted"
+        )
     if not aiter_can_use_preshuffle_paged_mqa():
         reasons.append(
             "needs the index cache in AITER's preshuffled layout, which the kernels "

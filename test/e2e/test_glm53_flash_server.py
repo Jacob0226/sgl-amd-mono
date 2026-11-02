@@ -1,7 +1,8 @@
 """GLM-5.3-Flash with --monokernel-backend amd on MI35x, TP4 (RFC #43949), across the
 switch points: decode steps of 1 to 8 rows run the kernels, wider ones the normal
 path, and requests join and leave a running batch that steps past 8 rows and back
-(a short GSM8K run, for gross failures); the tokens of covered steps scored again by
+(a short GSM8K run, for gross failures); with MTP, verify steps of 1 and 2 requests
+(4 and 8 rows) on the kernels (GSM8K and the draft's accept length); the tokens of covered steps scored again by
 the normal prefill path (KL consistency); each layer's launch against SGLang's own
 layer, and the tail's logits against SGLang's, under SGLANG_AMD_MONO_CHECK; the
 hidden states a covered step returns; and a fault on one rank that stops the server
@@ -16,7 +17,7 @@ from types import SimpleNamespace
 
 import requests
 import torch
-from glm53_flash_server import ARGS, ENV, MODEL
+from glm53_flash_server import ARGS, ENV, MODEL, MTP
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -37,6 +38,9 @@ GSM8K_BOUND = 0.90
 # Decode against prefill, one batch of prompts at a time (every decode step covered);
 # the normal path itself averages about 0.04 on 8 prompts
 KL_BOUND = 0.06
+# MTP (3 draft tokens) accepts about 3.3 tokens a step on this GSM8K run at TP4;
+# the bound is for gross failures
+MTP_ACCEPT_BOUND = 2.5
 
 
 def _launch(extra_env=None, extra_args=(), log=None):
@@ -48,6 +52,24 @@ def _launch(extra_env=None, extra_args=(), log=None):
         other_args=ARGS + ["--monokernel-backend", BACKEND, *extra_args],
         env=env,
         return_stdout_stderr=log,
+    )
+
+
+def _gsm8k():
+    """GSM8K, 200 questions 12 at a time, thinking on."""
+    return run_sgl_eval(
+        SimpleNamespace(
+            base_url=DEFAULT_URL_FOR_TEST,
+            model=MODEL,
+            eval_name="gsm8k",
+            num_examples=200,
+            num_threads=12,
+            max_tokens=32768,
+            temperature=1.0,
+            top_p=0.95,
+            seed=42,
+            sgl_eval_thinking=True,
+        )
     )
 
 
@@ -64,20 +86,7 @@ class TestMonokernelDecode(CustomTestCase):
     def test_gsm8k_past_the_largest_width(self):
         # 12 requests at a time: the batch steps past 8 rows as it fills, and back
         # as it drains
-        metrics = run_sgl_eval(
-            SimpleNamespace(
-                base_url=DEFAULT_URL_FOR_TEST,
-                model=MODEL,
-                eval_name="gsm8k",
-                num_examples=200,
-                num_threads=12,
-                max_tokens=32768,
-                temperature=1.0,
-                top_p=0.95,
-                seed=42,
-                sgl_eval_thinking=True,
-            )
-        )
+        metrics = _gsm8k()
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
 
@@ -96,6 +105,28 @@ class TestMonokernelDecode(CustomTestCase):
                 max_new_tokens=512,
                 trust_remote_code=True,
             )
+
+
+class TestMonokernelMtp(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.process = _launch(extra_args=[*MTP, "--watchdog-timeout", "1200"])
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process)
+
+    def test_gsm8k_and_accept_length_past_the_largest_width(self):
+        # 12 requests at a time: verify steps of 1 and 2 requests run the kernels,
+        # wider ones the normal path. A verify row that reads the wrong KDA state or
+        # keys of its draft chain lowers the accept length before the score
+        metrics = _gsm8k()
+        info = requests.get(DEFAULT_URL_FOR_TEST + "/get_server_info").json()
+        accept = info["internal_states"][0]["avg_spec_accept_length"]
+        print(f"{metrics=} {accept=}")
+        self.assertGreater(metrics["score"], GSM8K_BOUND)
+        self.assertGreater(accept, MTP_ACCEPT_BOUND)
 
 
 class TestMonokernelCheck(CustomTestCase):
