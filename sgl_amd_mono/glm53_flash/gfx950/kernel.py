@@ -4456,6 +4456,7 @@ def build_flash_kernel(key: FlashBuild):
             rti = fx.recast_iter(fx.Int32, xs)
             dn_route(load_bias())
             gpu.barrier()
+            tl_stamp(21)
             # each expert's row mask: wave w the experts w, w + 8, ..; lane s row s
             wv = _uniform(wave)
             row_keys = [
@@ -4474,6 +4475,7 @@ def build_flash_kernel(key: FlashBuild):
                         lds_st(rti, RT_MASK + 2 * e + 1, fx.Int32(bits >> 32))
                         lds_st(rti, RT_CNT + e, popcount(bits))
             gpu.barrier()
+            tl_stamp(22)
             # an exclusive scan of (picks | units << 16) in expert order -> each
             # expert's first pick and its units
             cnt = lds_ld(rti, RT_CNT + fx.min(tid, NE1 - 1))
@@ -4505,6 +4507,7 @@ def build_flash_kernel(key: FlashBuild):
             if tid == NE1 - 1:
                 lds_st(rti, RT_N, (exc + v) >> 16)
             gpu.barrier()
+            tl_stamp(23)
             # pick (row s, slot) at its expert's first pick + its rows below s
             if tid < S * MOE_SLOTS:
                 e = lds_ld(keys, tid)
