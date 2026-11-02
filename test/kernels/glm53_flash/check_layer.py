@@ -680,7 +680,8 @@ def check_keys(args, rank, tp, group, device) -> bool:
     from sgl_amd_mono.glm53_flash.gfx950.layout import SEL_STRIDE
     from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
 
-    rows = len(KEY_LENS)
+    key_lens = [int(v) for v in args.lens.split(",")] if args.lens else list(KEY_LENS)
+    rows = len(key_lens)
     key = FlashBuild(
         rows=rows,
         tp=tp,
@@ -696,7 +697,7 @@ def check_keys(args, rank, tp, group, device) -> bool:
         rt, ffn_weights(rank, tp, device), 0, dsa=dsa_weights(rank, tp, device)
     )
     x, res, post, comb = layer_inputs(rows, device)
-    caches, table, pt = dsa_caches(rows, device, list(KEY_LENS))
+    caches, table, pt = dsa_caches(rows, device, key_lens)
 
     def run(kv):
         c = replace(
@@ -718,7 +719,7 @@ def check_keys(args, rank, tp, group, device) -> bool:
     sel, sel_tags = sel[..., 0], sel[..., 1]
     g = _gen(30, device)
     ok = True
-    for r, n in enumerate(KEY_LENS):
+    for r, n in enumerate(key_lens):
         bound, tail = n // KPOOL, n % KPOOL
         if bound <= TOPK_POOLS:
             victims, spare = [0], None
@@ -741,7 +742,7 @@ def check_keys(args, rank, tp, group, device) -> bool:
                 flush=True,
             )
             ok = ok and whole and distinct and tail_ok and tagged
-            victims = picked[TOPK_TOKENS - tail : TOPK_TOKENS].tolist()
+            victims = picked[TOPK_TOKENS - max(tail, 1) : TOPK_TOKENS].tolist()
             unpicked = sorted(set(range(bound)) - set(ids.tolist()))
             spare = unpicked[0] * KPOOL
         kv = caches.kv_cache.clone()
@@ -1121,6 +1122,7 @@ def writes_only_its_rows(extra: dict, before: dict) -> bool:
 
 
 def main() -> int:
+    global MAX_LEN
     from sgl_amd_mono.common import guard
 
     ap = argparse.ArgumentParser()
@@ -1128,7 +1130,10 @@ def main() -> int:
     ap.add_argument("--rows", type=int, default=4)
     ap.add_argument("--deadline", type=float, default=10.0)
     ap.add_argument("--launches", type=int, default=3)
-    ap.add_argument("--max-pools", type=int, default=MAX_LEN // 4)
+    ap.add_argument(
+        "--max-len", type=int, default=MAX_LEN, help="a row's tokens at most"
+    )
+    ap.add_argument("--max-pools", type=int, default=0, help="default: --max-len / 4")
     ap.add_argument("--lens", type=str, default="", help="comma-separated row lengths")
     ap.add_argument("--compare-shuffled", action="store_true")
     ap.add_argument("--check-routing", action="store_true")
@@ -1144,6 +1149,8 @@ def main() -> int:
         "--writes", action="store_true", help="check the rows a launch writes"
     )
     args = ap.parse_args()
+    MAX_LEN = args.max_len
+    args.max_pools = args.max_pools or MAX_LEN // 4
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())

@@ -2752,8 +2752,18 @@ def build_flash_kernel(key: FlashBuild):
                 val = parts[0]
                 for e in range_constexpr(1, 4):
                     val = (e_w == e).select(parts[e], val)
-                if (e_w < 4) & (pw < n_pools):
-                    put(mb("iscores"), s * MAXP + pw, val * ksc)
+                # every lane stores, the others past num_records (dropped): a
+                # divergent store lets the compiler run the tile loop's lanes apart,
+                # under its cross-lane reductions and MFMAs
+                keep = (e_w < 4) & (pw < n_pools)
+                bo.buffer_store(
+                    fx.Vector.from_elements(
+                        [(val * ksc).bitcast(fx.Int32), tag], fx.Int32
+                    ),
+                    _rsrc(mb("iscores"), S * MAXP * 8),
+                    keep.select(s * MAXP + pw, fx.Int32(S * MAXP)) * 2,
+                    cache_modifier=CM_DEV,
+                )
 
             for s in range_constexpr(S):
                 pos = row_word(s, ROW_POS)
