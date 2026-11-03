@@ -77,6 +77,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             dense_shuffled=shuffled and dense,
             tokens=kind == "embed",
             head=head,
+            grouped=rows > 8 and not (dense or head),
         )
         runtimes[kind] = FlashRuntime(key, rank, group, device)
         runtimes[kind].set_deadline(60.0)
