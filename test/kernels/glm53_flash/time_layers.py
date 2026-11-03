@@ -6,7 +6,9 @@
 One HIP graph holds a step of launches, inputs chained layer to layer, every row
 live. Each layer has its own random weights (``check_layer.py``'s, seeded by layer,
 so they stream from HBM as in a served step), its own state or caches, and every
-sparse-attention row sits at position ``--pos``. ``--kind model`` is the served
+sparse-attention row sits at position ``--pos``; with ``--verify L`` (``dsa``) the
+launch is an MTP verify step, rows // L requests whose L rows sit at ``--pos`` ..
+``--pos + L - 1`` on the request's page table. ``--kind model`` is the served
 step: layers 3 to 43 in model order (30 KDA, 11 sparse attention) on one runtime a
 kind; ``--kind full`` the whole served step as the spec builds it: layer 0 from the
 step's tokens, the dense layers 1 and 2, layers 3 to 44, then the tail. ``kda``,
@@ -49,6 +51,45 @@ def _kinds(args) -> list:
     return [args.kind] * args.layers
 
 
+def _verify_caches(rows: int, L: int, pos: int, device):
+    """``check_layer``'s verify inputs: rows // L requests of pos + 1 tokens, request
+    r's row j at pos + j, SGLang's verify page table (the request's row for each of
+    its rows), tail rings of 4 + L; rows past the requests are pads."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import INDEX_DIM, KPOOL
+    from sgl_amd_mono.glm53_flash.gfx950.layout import (
+        ROW_BT,
+        ROW_POOL_SLOT,
+        ROW_POS,
+        ROW_SLOT,
+        ROW_TAIL_SLOT,
+        ROW_WORDS,
+    )
+
+    R = rows // L
+    caches, _, pt = cl.dsa_caches(R, device, [pos + 1] * R)
+    g = cl._gen(11, device)
+    tails = [
+        torch.randn(R + 1, 4 + L, INDEX_DIM, generator=g, device=device).bfloat16()
+        for _ in range(2)
+    ]
+    caches = replace(caches, tail_k=tails[0], tail_g=tails[1])
+    table = torch.full((rows, ROW_WORDS), -1, dtype=torch.int32, device=device)
+    table[:, ROW_BT] = 0
+    for r in range(R):
+        for j in range(L):
+            s = r * L + j
+            slot = cl.kv_slot(pt, r, pos + j)
+            table[s, [ROW_POS, ROW_SLOT, ROW_POOL_SLOT, ROW_TAIL_SLOT]] = torch.tensor(
+                [pos + j, slot, slot // KPOOL, (r + 1) * KPOOL],
+                dtype=torch.int32,
+                device=device,
+            )
+            table[s, ROW_BT] = s
+    return caches, table, pt.repeat_interleave(L, 0).contiguous()
+
+
 def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
     """The runtimes (one a kind), each layer's op and launch arguments."""
     from sgl_amd_mono.glm53_flash.gfx950.config import GLOBAL_INTER
@@ -82,6 +123,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             grouped=not args.per_row_moe
             and rows >= GROUPED_FROM
             and not (dense or head),
+            verify=args.verify if dsa else 1,
         )
         runtimes[kind] = FlashRuntime(key, rank, group, device)
         runtimes[kind].set_deadline(60.0)
@@ -118,7 +160,10 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             attn = cl.dsa_weights(rank, tp, device)
             if shuffled:
                 attn = cl.shuffled_copy(attn)
-            caches, table, pt = cl.dsa_caches(rows, device, [args.pos + 1] * rows)
+            if args.verify > 1:
+                caches, table, pt = _verify_caches(rows, args.verify, args.pos, device)
+            else:
+                caches, table, pt = cl.dsa_caches(rows, device, [args.pos + 1] * rows)
             ops.append(FlashLayerOp(runtimes[kind], ffn, n, dsa=attn))
             extra.append(dict(caches=caches, rows=table, page_table=pt))
     cl._gen = _GEN
@@ -179,7 +224,8 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
     dist.all_gather_object(medians, (median, clean), group=group)
     if rank == 0:
         print(
-            f"TIME kind={args.kind} rows={rows} tp={tp} launches={len(kinds)} "
+            f"TIME kind={args.kind} rows={rows} verify={args.verify} tp={tp} "
+            f"launches={len(kinds)} "
             f"pos={args.pos} fp8={'row-major' if args.row_major else 'in-place'} "
             f"us_per_launch median={median:.2f} min={min(per_launch):.2f} "
             f"max={max(per_launch):.2f} "
@@ -219,8 +265,12 @@ def main() -> int:
         action="store_true",
         help="the per-row MoE at every width, the baseline of the grouped one",
     )
+    ap.add_argument(
+        "--verify", type=int, default=1, help="dsa: an MTP verify step's rows a request"
+    )
     args = ap.parse_args()
-    cl.MAX_LEN = max(cl.MAX_LEN, (args.pos + 256) // 256 * 256)
+    assert args.verify == 1 or args.kind == "dsa", "--verify times dsa launches"
+    cl.MAX_LEN = max(cl.MAX_LEN, (args.pos + args.verify - 1 + 256) // 256 * 256)
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())
