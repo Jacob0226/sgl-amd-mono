@@ -110,7 +110,9 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
 
     def test_rows_past_65536_pools_of_a_1m_context(self):
         # SGLang's pools for a 1M-token context; 262148 tokens complete pool 65536,
-        # whose id takes 17 bits; up to 650000 tokens, as agentic traces reach
+        # whose id takes 17 bits; up to 650000 tokens, as agentic traces reach. Past
+        # 65536 pools a wrong score may not fault: --check-keys compares the
+        # selection with a torch top-512
         long = ["--kind", "dsa", "--max-len", "655360", "--max-pools", "262144"]
         mixed = "262150,331001,650000,409000,65537,3000,1,0"
         for rows, args in (

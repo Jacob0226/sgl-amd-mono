@@ -2752,9 +2752,10 @@ def build_flash_kernel(key: FlashBuild):
                 val = parts[0]
                 for e in range_constexpr(1, 4):
                     val = (e_w == e).select(parts[e], val)
-                # every lane stores, the others past num_records (dropped): a
-                # divergent store lets the compiler run the tile loop's lanes apart,
-                # under its cross-lane reductions and MFMAs
+                # every lane stores, the others past num_records (dropped): FlyDSL's
+                # lowering merges a divergent store here with the first tile's, and
+                # the tile loop's MFMAs then run with the storing lanes off and
+                # overwrite their index (https://github.com/ROCm/FlyDSL/issues/1358)
                 keep = (e_w < 4) & (pw < n_pools)
                 bo.buffer_store(
                     fx.Vector.from_elements(
