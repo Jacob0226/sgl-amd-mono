@@ -577,10 +577,7 @@ class _Built:
             rpi = forward_batch.req_pool_indices[: S // V]
             pos = positions[:S]
             if V > 1:
-                if (
-                    getattr(backend.linear_attn_backend, "accept_lens_pool", None)
-                    is not None
-                ):
+                if backend.linear_attn_backend.accept_lens_pool is not None:
                     raise RuntimeError(
                         "GLM-5.3-Flash monokernel: a verify launch reads the committed "
                         "KDA state, not the fused accept's"
