@@ -55,15 +55,15 @@ def _launch(extra_env=None, extra_args=(), log=None):
     )
 
 
-def _gsm8k():
-    """GSM8K, 200 questions 12 at a time, thinking on."""
+def _gsm8k(threads=12):
+    """GSM8K, 200 questions ``threads`` at a time, thinking on."""
     return run_sgl_eval(
         SimpleNamespace(
             base_url=DEFAULT_URL_FOR_TEST,
             model=MODEL,
             eval_name="gsm8k",
             num_examples=200,
-            num_threads=12,
+            num_threads=threads,
             max_tokens=32768,
             temperature=1.0,
             top_p=0.95,
@@ -117,11 +117,11 @@ class TestMonokernelMtp(CustomTestCase):
         if getattr(cls, "process", None) is not None:
             terminate_and_kill_process_tree(cls.process)
 
-    def test_gsm8k_and_accept_length_past_the_largest_width(self):
-        # 12 requests at a time: verify steps of 1 and 2 requests run the kernels,
-        # wider ones the normal path. A verify row that reads the wrong KDA state or
-        # keys of its draft chain lowers the accept length before the score
-        metrics = _gsm8k()
+    def test_gsm8k_and_accept_length_on_the_kernels(self):
+        # 2 requests at a time, so every verify step fits the 8-row width and runs
+        # the kernels. A verify row that reads the wrong KDA state or keys of its
+        # draft chain lowers the accept length before the score
+        metrics = _gsm8k(threads=2)
         info = requests.get(DEFAULT_URL_FOR_TEST + "/get_server_info").json()
         accept = info["internal_states"][0]["avg_spec_accept_length"]
         print(f"{metrics=} {accept=}")
