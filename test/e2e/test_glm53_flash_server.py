@@ -2,8 +2,9 @@
 switch points: decode steps of 1 to 16 rows run the kernels, wider ones the normal
 path, and requests join and leave a running batch that steps past 16 rows and back
 (a short GSM8K run, for gross failures); with MTP, verify steps of 1 to 4 requests
-(4 to 16 rows) on the kernels (GSM8K and the draft's accept length); the tokens of covered steps scored again by
-the normal prefill path (KL consistency); each layer's launch against SGLang's own
+(4 to 16 rows) on the kernels (GSM8K and the draft's accept length), and eager
+verify steps that check each request's page-table row is repeated; the tokens of
+covered steps scored again by the normal prefill path (KL consistency); each layer's launch against SGLang's own
 layer, and the tail's logits against SGLang's, under SGLANG_AMD_MONO_CHECK; the
 hidden states a covered step returns; and a fault on one rank that stops the server
 before any token of the failed step is sent."""
@@ -127,6 +128,31 @@ class TestMonokernelMtp(CustomTestCase):
         print(f"{metrics=} {accept=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
         self.assertGreater(accept, MTP_ACCEPT_BOUND)
+
+
+class TestMonokernelMtpEager(CustomTestCase):
+    def test_verify_steps_find_their_request_s_page_table_row_repeated(self):
+        # the sparse-attention launch reads a verify request's keys from its first
+        # page-table row; an eager verify step checks that the DSA backend repeats
+        # the row for each of the request's rows (a graph replays unchecked). 4
+        # requests of 2 to 11 pages, so the rows differ between requests
+        para = "The river valley archive lists the flood height of every year. "
+        process = _launch(extra_args=[*MTP, "--disable-cuda-graph"])
+        try:
+            r = requests.post(
+                DEFAULT_URL_FOR_TEST + "/generate",
+                json={
+                    "text": [f"Record {i}. " + para * (40 + 60 * i) for i in range(4)],
+                    "sampling_params": {"max_new_tokens": 32, "temperature": 0},
+                },
+                timeout=600,
+            )
+            r.raise_for_status()
+        finally:
+            terminate_and_kill_process_tree(process)
+        verify = [out["meta_info"]["spec_verify_ct"] for out in r.json()]
+        print(f"{verify=}")
+        self.assertTrue(len(verify) == 4 and min(verify) > 0, verify)
 
 
 class TestMonokernelCheck(CustomTestCase):
