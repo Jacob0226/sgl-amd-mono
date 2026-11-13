@@ -174,6 +174,11 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
     monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", _dtypes())
     monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: True)
     assert flash.SPEC.config_disable_reasons(_cfg(), FLASH) == []
+    # --mamba-ssm-dtype bfloat16
+    monkeypatch.setattr(
+        mamba_utils, "mamba2_state_dtype", _dtypes(temporal=torch.bfloat16)
+    )
+    assert flash.SPEC.config_disable_reasons(_cfg(), FLASH) == []
     kda = TEXT.linear_attn_config["kda_layers"]
     text = SimpleNamespace(
         **{
@@ -188,7 +193,7 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
         }
     )
     monkeypatch.setattr(
-        mamba_utils, "mamba2_state_dtype", _dtypes(temporal=torch.bfloat16)
+        mamba_utils, "mamba2_state_dtype", _dtypes(temporal=torch.float16)
     )
     # SGLang's k-pool writer keeps the index cache row-major; the kernels write tiles
     monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: False)
@@ -203,7 +208,7 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
         "hidden_size = 4096",
         "moe_layer_freq = 1",
         "num_heads = 64",
-        "KDA state in f32",
+        "KDA state in f32 or bf16",
         "--page-size 64",
         "preshuffled layout",
         "Quark checkpoint",
