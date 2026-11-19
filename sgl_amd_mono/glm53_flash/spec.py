@@ -256,8 +256,16 @@ def _dense(config, i: int) -> bool:
     return i < _text(config).first_k_dense_replace
 
 
-def _config_disable_reasons(cfg, hf_config) -> list[str]:
+def _state_dtypes():
+    """The KDA state pool's dtypes. GLM-5.3-Flash's cache params name no dtype, so
+    SGLang allocates the pool with ``mamba2_state_dtype(None)``: ``--mamba-ssm-dtype``,
+    never a ``mamba_ssm_dtype`` in the checkpoint's config."""
     from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+
+    return mamba2_state_dtype(None)
+
+
+def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sglang.srt.layers.attention.dsa.utils import (
         aiter_can_use_preshuffle_paged_mqa,
     )
@@ -274,7 +282,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         for key, want in LINEAR_ATTN_CONFIG.items()
         if linear.get(key) != want
     ]
-    dtypes = mamba2_state_dtype(hf_config)
+    dtypes = _state_dtypes()
     if dtypes.temporal not in (torch.float32, torch.bfloat16) or (
         dtypes.conv != torch.bfloat16
     ):
@@ -790,7 +798,6 @@ def _deadline(key, deadline_s: float, longest_s: int) -> float:
 
 
 def _build(model, hf_config, ctx) -> _Built:
-    from sglang.srt.configs.mamba_utils import mamba2_state_dtype
     from sglang.srt.runtime_context import get_parallel, get_spec, process_model_config
 
     from sgl_amd_mono.common import guard
@@ -878,7 +885,7 @@ def _build(model, hf_config, ctx) -> _Built:
         if sp.speculative_algorithm is not None
         else 1
     )
-    state_bf16 = mamba2_state_dtype(hf_config).temporal == torch.bfloat16
+    state_bf16 = _state_dtypes().temporal == torch.bfloat16
     runtimes, heads = {}, {}
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
     widths = sorted({_width(r) for r in ctx.widths if r <= cap})

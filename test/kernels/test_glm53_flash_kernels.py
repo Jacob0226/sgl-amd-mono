@@ -11,9 +11,10 @@ MLP on its own FFN input, on shuffled and row-major FP8 alike; the launch from t
 step's tokens equals the dense launch on the gathered embedding rows and writes the
 spec's step tables, for steps of fewer rows than the width too; an MTP verify launch
 equals its draft tokens' decode launches bitwise (outputs, KDA verify scratch,
-caches and kpool rings) and keeps the committed KDA state; a KDA decode or verify
-launch on a bf16 recurrent state equals the f32 launch on the same values, its
-written state and verify scratch rounded to bf16; sparse-attention
+caches and kpool rings) and keeps the committed KDA state; a KDA, dense or
+from-the-tokens decode or verify launch on a bf16 recurrent state equals the f32
+launch on the same values, its written state and verify scratch rounded to bf16;
+sparse-attention
 launches and key selection hold for rows past 65536 pools of a 1M-token context, up
 to 650000 tokens; the tail's logits match a torch tail and an f32 tail, back-to-back
 tails included."""
@@ -138,6 +139,12 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
             for tp in (2, 4, 8):
                 if tp > 2 or rows <= 4:
                     self._run(tp, *args, "--check-state-bf16")
+        # layers 1 and 2 (dense) and layer 0 (from the tokens): decode and MTP 3
+        for kind in ("dense", "embed"):
+            self._check("--kind", kind, "--check-state-bf16", widths=(2, 8))
+            args = ["--kind", kind, "--rows", "4", "--verify", "4"]
+            for tp in (2, 4, 8):
+                self._run(tp, *args, "--check-state-bf16")
 
     def test_rows_past_65536_pools_of_a_1m_context(self):
         # SGLang's pools for a 1M-token context; 262148 tokens complete pool 65536,
