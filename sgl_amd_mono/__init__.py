@@ -25,7 +25,12 @@ SPECS = {
         "DeepseekV4ForCausalLMDSpark",
         "deepseek_v41",
     ): "sgl_amd_mono.deepseek_v41.draft:SPEC",
-    ("Glm5NextForConditionalGeneration", None): "sgl_amd_mono.glm53_flash.spec:SPEC",
+    # the wide launch's spec (ReplaySSM ring verify) excludes the narrow one's
+    ("Glm5NextForConditionalGeneration", None): (
+        "sgl_amd_mono.glm53_flash.wide_spec:SPEC"
+        if os.environ.get("SGLANG_AMD_MONO_GLM53_FLASH_WIDE") == "1"
+        else "sgl_amd_mono.glm53_flash.spec:SPEC"
+    ),
     ("GlmMoeDsaForCausalLM", None): "sgl_amd_mono.glm53.spec:SPEC",
     ("GlmMoeDsaForCausalLMNextN", None): "sgl_amd_mono.glm53.draft:SPEC",
     ("MiniMaxM3SparseForCausalLM", None): "sgl_amd_mono.minimax.spec:SPEC",
