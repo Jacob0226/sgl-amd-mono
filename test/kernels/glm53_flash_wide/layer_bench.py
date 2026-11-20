@@ -6,6 +6,8 @@ torch / the standalone stages:
     o       sum over ranks of core_r @ W_o,r^T (bf16 tolerance); every rank the same bits
     R_mid   ``_mhc_post_torch`` of the launch's o (bitwise)
     x_f, post_f, comb_f   ``_mhc_pre_torch`` + RMSNorm of R_mid
+    ids, w  top-8 of sigmoid(x_f @ W_r^T) + bias (torch, the launch's x_f): the picked
+            set (near-ties excused), weights; every rank the same bits
 
     torchrun --nproc-per-node 4 layer_bench.py [--reqs 3,6,16] [--stop fgate] [--time]
 """
@@ -26,7 +28,7 @@ from mhc_bench import mhc_post_ref, mhc_pre_ref, rmsnorm_ref  # noqa: E402
 from tile_bench import bench  # noqa: E402
 
 from sgl_amd_mono.common.peer import PeerBuffer  # noqa: E402
-from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN  # noqa: E402
+from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN, MOE_SLOTS, N_EXPERTS, TOP_K  # noqa: E402
 from sgl_amd_mono.glm53_flash.gfx950.wide import coll, kda, layer, mhc  # noqa: E402
 
 HC = mhc.HC
@@ -66,6 +68,8 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             base=rnd(24, scale=0.3),
             norm=(1 + rnd(HIDDEN, scale=0.1)).to(torch.bfloat16),
         ))
+    w_r = rnd(N_EXPERTS, HIDDEN, scale=0.02, dt=torch.bfloat16)
+    bias_r = rnd(N_EXPERTS, scale=0.5, dt=torch.bfloat16)
     # this rank's heads
     lg = torch.Generator(device=dev).manual_seed(100 + rank)
     w_in = rnd(NPROJ, HIDDEN, scale=0.02, dt=torch.bfloat16, g=lg)
@@ -100,7 +104,8 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     acc_o = z(m, HIDDEN, dt=torch.bfloat16)
     res_mid = z(m, HC, HIDDEN, dt=torch.bfloat16)
     x_f, post_f, comb_f = z(m, HIDDEN, dt=torch.bfloat16), z(m, HC), z(m, HC * HC)
-    launch = layer.build(m, tt, tp, LB, ONORM_EPS, bool(sbf), True, a.stop)
+    ids, wts = z(m, MOE_SLOTS, dt=torch.int32), z(m, MOE_SLOTS)
+    launch = layer.build(m, tt, tp, LB, ONORM_EPS, bool(sbf), True, a.stop, trace=a.trace)
     plan = launch.plan
     epoch = z(plan["epoch_words"], dt=torch.int32)
     scratch = z(plan["scratch_words"], dt=torch.int32)
@@ -115,7 +120,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             w_in, proj, conv_w, conv_st, cs_idx, mine["iw"], idx, w_fgb, a_log, dt_bias,
             state, idx, mine["rawv"], mine["rawk"], mine["ring_g"], mine["ring_beta"], idx,
             on_w, mine["core"], w_o, acc_o, ff["fn"], ff["scale"], ff["base"], ff["norm"],
-            res_mid, x_f, post_f, comb_f, epoch, scratch)
+            res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, epoch, scratch)
     pl = [t.data_ptr() for t in ptrs] + [peers.addresses.data_ptr(), rank]
 
     def go():
@@ -142,7 +147,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
         o_ref = sum(c.float() @ w.float().T for c, w in zip(cores, wos)).to(torch.bfloat16)
         errs["o"] = rel(o, o_ref)
         errs["o_ranks"] = max(float((t != o).any()) for t in gather(o))
-        if a.stop == "fgate":
+        if layer.STOPS.index(a.stop) >= 2:
             r_ref = mhc_post_ref(o, res_in, post_a, comb_a)
             errs["R_mid"] = rel(res_mid, r_ref)
             p_ref, c_ref, li_ref = mhc_pre_ref(res_mid, ff["fn"], ff["scale"], ff["base"])
@@ -155,6 +160,11 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             errs["post_f"] = rel(post_f, p_ref)
             errs["comb_f"] = rel(comb_f, c_ref)
             errs["xf_ranks"] = max(float((t != x_f).any()) for t in gather(x_f))
+        if a.stop == "route":
+            errs.update(route_check(x_f, w_r, bias_r, ids, wts))
+            errs["route_ranks"] = max(
+                float((t != ids).any()) for t in gather(ids)
+            ) + max(float((t != wts).any()) for t in gather(wts))
     # repeated launches: the epoch hand-offs, across ranks
     for _ in range(a.launches):
         go()
@@ -167,10 +177,50 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
         dist.barrier(cpu)
         line += f"  layer {bench(lambda _w: go(), [None] * 4):6.1f} us"
     print(line, flush=True)
+    if a.trace:
+        from sgl_amd_mono.common.plan import BLOCKS
+        from sgl_amd_mono.glm53_flash.gfx950.wide.m1a import TRACE_POINTS
+
+        sc = layer.scratch_layout(m, tt, True)
+        acc = None
+        for _ in range(20):
+            go()
+            torch.cuda.synchronize()
+            tr = scratch[sc["trace"]:][: BLOCKS * TRACE_POINTS * 2].view(torch.int64)
+            tr = tr.view(BLOCKS, TRACE_POINTS).double()
+            tr = (tr - tr[:, 0].min()) / 100.0
+            acc = tr if acc is None else acc + tr
+        tr = acc / 20
+        names = ["start", "aseam", "agate", "inproj", "kda", "oproj", "reduce", "fseam",
+                 "fgate", "epoch", "router", "route"]
+        for p_, nm in sorted(enumerate(names), key=lambda x: x[0] if x[0] != 9 else 99):
+            col = tr[:, p_]
+            col = col[(col > -1e5) & (col < 1e5)]
+            if col.numel() and rank == 0:
+                print(f"    {nm:>7}  median {col.median():6.2f}  max {col.max():6.2f} us", flush=True)
     peers.close()
     tol = {"core": 1e-6, "proj": 1e-2, "o": 1e-2, "o_ranks": 0.0, "R_mid": 1e-6, "x_f": 1e-3,
-           "post_f": 1e-5, "comb_f": 1e-5, "xf_ranks": 0.0}
+           "post_f": 1e-5, "comb_f": 1e-5, "xf_ranks": 0.0, "ids_bad": 0, "w": 1e-5,
+           "shared": 0, "route_ranks": 0.0}
     return all(errs[k] <= v for k, v in tol.items() if k in errs)
+
+
+def route_check(x_f, w_r, bias_r, ids, wts):
+    """Picked sets against torch (a row whose 8th and 9th keys are within 1e-5 is
+    excused), the weights in id order, the shared slot."""
+    s = torch.sigmoid(x_f.float() @ w_r.float().T)
+    keys = s + bias_r.float()
+    kv, ki = keys.topk(TOP_K + 1, dim=1)
+    ref_ids = ki[:, :TOP_K]
+    tie = (kv[:, TOP_K - 1] - kv[:, TOP_K]) < 1e-5
+    mi = ids[:, :TOP_K].long()
+    same = (mi.sort(1).values == ref_ids.sort(1).values).all(1)
+    bad = int((~same & ~tie).sum().item())
+    ws = s.gather(1, mi)
+    w_ref = ws / ws.sum(1, keepdim=True) * 2.5
+    shared = int(((ids[:, TOP_K] != N_EXPERTS) | (wts[:, TOP_K] != 1.0)).sum().item())
+    return {"ids_bad": bad, "ties": int(tie.sum().item()), "w": rel(wts[:, :TOP_K], w_ref),
+            "shared": shared}
 
 
 def main():
@@ -178,9 +228,10 @@ def main():
     ap.add_argument("--reqs", default="3,6,16")
     ap.add_argument("--tt", type=int, default=6)
     ap.add_argument("--state-bf16", default="1")
-    ap.add_argument("--stop", default="fgate", choices=layer.STOPS)
+    ap.add_argument("--stop", default="route", choices=layer.STOPS)
     ap.add_argument("--launches", type=int, default=10)
     ap.add_argument("--time", action="store_true")
+    ap.add_argument("--trace", action="store_true")
     a = ap.parse_args()
     rank = int(os.environ["RANK"])
     tp = int(os.environ["WORLD_SIZE"])
