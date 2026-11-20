@@ -14,7 +14,7 @@ as that kernel. Last, wave t applies the gated RMSNorm (o_norm, sigmoid(g)) to t
 t's 128 outputs -> ``core_out`` [rows, 2048] bf16, o_proj's input.
 
 The in_proj output ``proj`` [rows, 6416] (q | k | v | beta | f_a | g_a) is read with
-plain loads after ``c["wait_proj"](req)``.
+plain loads after ``c["wait_proj"](req, head)``.
 """
 
 import struct
@@ -195,7 +195,9 @@ def kda_head(c, n, hv, lds):
             [fx.Vector(_load(st_base, row + (i * KSPLIT + ks) * 4, state_t, 4)) for i in range(KG)]
         )
 
-    c["wait_proj"](n)
+    c["wait_proj"](n, hv)
+    if const_expr("stamp" in c):
+        c["stamp"](8)
     # f_b / g_b: wave w's MFMA gives rows 16 w .. of both for the TT tokens (bf16 out)
     t = fx.min(lane % 16, TT - 1)
     for which in range_constexpr(2):
@@ -215,6 +217,8 @@ def kda_head(c, n, hv, lds):
     b_row = bos + fx.min(ch, TT - 1)
     bb = fx.Float32(fx.BFloat16(_load(x, b_row * xs_ + BETA_0 + hv, T.bf16, 1, pcm)))
     gpu.barrier()
+    if const_expr("stamp" in c):
+        c["stamp"](9)
 
     # conv + silu, rounded to bf16 as the unfused path stores it
     qk = []
@@ -270,6 +274,8 @@ def kda_head(c, n, hv, lds):
         for tt in range_constexpr(TT):
             fx.ptr_store(ss[tt], s_ss + ((th // 64) * TT + tt))
     gpu.barrier()
+    if const_expr("stamp" in c):
+        c["stamp"](10)
 
     alive = h0 >= 0
     hsf = [
@@ -321,6 +327,8 @@ def kda_head(c, n, hv, lds):
         if ks < TT:
             fx.ptr_store(fx.Float32(val.to(fx.BFloat16)), s_o + (ks * KD + v0 + cg + NCG * j))
     gpu.barrier()
+    if const_expr("stamp" in c):
+        c["stamp"](11)
 
     # gated RMSNorm: wave tt = token tt
     core_out, out_cm, eps = rsrc(a["core_out"]), c.get("out_cm", 0), c["onorm_eps"]
@@ -344,6 +352,8 @@ def kda_head(c, n, hv, lds):
                 cache_modifier=out_cm,
             )
     gpu.barrier()
+    if const_expr("stamp" in c):
+        c["stamp"](12)
 
 
 # ---------------------------------------------------------------- standalone
@@ -377,7 +387,7 @@ def standalone(reqs, tt, lower_bound, onorm_eps, state_bf16, has_iw):
         a.update(zip(IARGS, ints))
         c = dict(
             TT=tt, tid=tid, args=a, lower_bound=lower_bound, onorm_eps=onorm_eps,
-            state_bf16=state_bf16, has_iw=has_iw, wait_proj=lambda n: None,
+            state_bf16=state_bf16, has_iw=has_iw, wait_proj=lambda n, hv: None,
         )
         b = fx.block_idx.x
         kda_head(c, b // NH, b % NH, lds)

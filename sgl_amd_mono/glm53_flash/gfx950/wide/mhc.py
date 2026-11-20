@@ -5,7 +5,7 @@
 """GLM-5.3-Flash mHC pre (and the hc_post folded in front of it) for 16-128 rows,
 on a residual every TP rank holds in full.
 
-Two stages, handing off through ``c["put"]`` / ``c["get"]`` (plain stores and loads in
+Two stages, handing off through ``c["put"]`` / ``c["getn"]`` (plain stores and loads in
 a standalone launch, flagged mailboxes in the layer launch):
 
 - ``slice_task(c, task)``: hidden columns 32 task .. + 32 of every row. With ``x_in``
@@ -291,9 +291,10 @@ def gate_row(c, t):
     if tid < groups * PART:
         g = tid // PART
         j = tid % PART
-        acc = c["get"](a["pmix"], ((g * GATE_BLOCK) * s + t) * PART + j)
+        vals = c["getn"](a["pmix"], [((g * GATE_BLOCK + k) * s + t) * PART + j for k in range(GATE_BLOCK)])
+        acc = vals[0]
         for k in range_constexpr(1, GATE_BLOCK):
-            acc = acc + c["get"](a["pmix"], ((g * GATE_BLOCK + k) * s + t) * PART + j)
+            acc = acc + vals[k]
         fx.ptr_store(acc, red + (g * PART + j))
     gpu.barrier()
     sv = red + groups * PART  # pre [HC] | ss [WAVES] | v [64]
@@ -335,6 +336,8 @@ def gate_row(c, t):
     gam = [g for e in range(CPT // 2) for g in bf2_f32(fx.Int32(gw[e]))]
     ys = fx.Vector.from_elements([li[q] * rstd * gam[q] for q in range(CPT)], fx.Float32)
     c["store_x"](t, col, ys.to(fx.BFloat16).bitcast(fx.Int32))
+    if const_expr("x_done" in c):
+        c["x_done"](t)
     if wave == 0:
         cv = fx.ptr_load(sv + HC + WAVES + lane) * sc[2] + base
         cv = hw_exp(cv - _row_max(cv))
@@ -375,8 +378,8 @@ def standalone(s, post, which="both"):
         def put(base, i, v):
             bo.buffer_store(v, rsrc(base), i)
 
-        def get(base, i):
-            return ld_f32(base, i)
+        def getn(base, idxs):
+            return [ld_f32(base, i) for i in idxs]
 
         def store_x(t, col, words):
             bo.buffer_store(words, rsrc(args["x_out"]), (t * HIDDEN + col) // 2)
@@ -384,7 +387,7 @@ def standalone(s, post, which="both"):
         return dict(
             S=s, tid=tid, lane=tid % 64, wave=tid // 64,
             rl=sm.rl.ptr, fl=sm.fl.ptr, red=sm.red.ptr,
-            args=args, put=put, get=get, store_x=store_x,
+            args=args, put=put, getn=getn, store_x=store_x,
         )
 
     def unpack(res_in, res_out, x_in, post_in, comb_in, hc_fn, hc_scale, hc_base,
