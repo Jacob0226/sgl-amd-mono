@@ -120,9 +120,10 @@ def _top8(lane, raws, bs):
 
 
 @flyc.jit
-def route_row(tid, t, rows, ks, parts, bias, ids_out, w_out, red, shared_w):
+def route_row(tid, t, rows, ks, parts, bias, ids_out, w_out, logits, red, shared_w):
     """Row ``t`` (its partials complete): wave w sums K slices w, w + WAVES, .. of its
-    lanes' candidates, wave 0 the waves in order, then the top-8."""
+    lanes' candidates, wave 0 the waves in order (stored to ``logits`` [rows,
+    N_EXPERTS] f32, for SGLang's own top-k), then the top-8."""
     lane, wave = tid % 64, tid // 64
     plane = rows * N_EXPERTS
     r_p = rsrc(parts, ks * plane * 4)
@@ -155,10 +156,14 @@ def route_row(tid, t, rows, ks, parts, bias, ids_out, w_out, red, shared_w):
             for i in range(CAND)
         ]
         raws = []
+        r_l = rsrc(logits, rows * N_EXPERTS * 4)
         for i in range_constexpr(CAND):
             logit = fx.ptr_load(red + i * 64 + lane)
             for w in range_constexpr(1, WAVES):
                 logit = logit + fx.ptr_load(red + ((w * CAND + i) * 64 + lane))
+            bo.buffer_store(
+                logit, r_l, t * N_EXPERTS + lane + 64 * i, mask=lane + 64 * i < N_EXPERTS
+            )
             raws.append(hw_rcp(1.0 + hw_exp(-logit)))
         e, wt = _top8(lane, raws, bs)
         sh = lane == TOP_K
