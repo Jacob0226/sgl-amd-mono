@@ -18,7 +18,8 @@ from sgl_amd_mono.glm53_flash.gfx950.wide import kda, m1a, mhc  # noqa: E402
 
 HC, NH, KD, P, NPROJ = mhc.HC, kda.NH, kda.KD, kda.P, kda.NPROJ
 NAMES = ["start", "aseam", "agate", "-", "inproj", "kda", "epoch", "proj wait",
-         "k:wait", "k:fg+loads", "k:conv+l2", "k:recur", "k:norm"]
+         "k:wait", "k:fg+loads", "k:conv+l2", "k:recur", "k:norm+ring", "k:qk conv", "k:v conv",
+         "k:g+beta"]
 
 
 def main():
@@ -67,9 +68,11 @@ def main():
         g = plan["gemm"]
         print(f"rows {m}  tasks aseam {plan['n_aseam']} inproj {plan['n_inproj']} "
               f"({g.bm}x{g.bn} ks{g.ks}) kda {plan['n_kda']}")
-        for p in (0, 1, 2, 4, 7, 8, 9, 10, 11, 12, 5, 6):
+        for p in (0, 1, 2, 4, 7, 8, 9, 13, 14, 15, 10, 11, 12, 5, 6):
             col = tr[:, p]
             col = col[(col > -1e5) & (col < 1e5) & (col != 0)]
+            if col.numel() == 0:
+                continue
             print(f"  {NAMES[p]:>10}  min {col.min():6.2f}  median {col.median():6.2f}  max {col.max():6.2f} us")
 
 
