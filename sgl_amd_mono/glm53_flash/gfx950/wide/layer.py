@@ -11,6 +11,8 @@ CTAs, one task loop a stage, no grid barrier) a KDA layer on each of ``tp`` rank
     reduce  the owner sums its pieces in rank order and stores them on every rank (AG)
     fseam   FFN mHC slices: R_mid = post o + comb R (hc_post) and their mixes
     fgate   a row's FFN mixes -> post_f / comb_f, the FFN input x_f
+    router  split-K f32 partials of x_f @ W_r^T (``route``)
+    route   a row: logits, sigmoid, top-8 + the shared slot -> ids / weights [rows, 9]
 
 ``stop`` ends the launch after a stage (``STOPS``). Hand-offs inside a rank: tagged
 mailbox pairs (tag = epoch + 1) for the slice partials, flag words (:= epoch + 1) for
@@ -28,8 +30,8 @@ from sgl_amd_mono.common.epoch import EPOCH_MARKS, epoch_begin, epoch_end
 from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, rsrc, uniform
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, first_task, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, sreg
-from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN
-from sgl_amd_mono.glm53_flash.gfx950.wide import coll, kda, mhc, tile_dma
+from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN, N_EXPERTS
+from sgl_amd_mono.glm53_flash.gfx950.wide import coll, kda, mhc, route, tile_dma
 from sgl_amd_mono.glm53_flash.gfx950.wide.m1a import (
     CNT_STRIDE,
     TRACE_POINTS,
@@ -47,7 +49,7 @@ from sgl_amd_mono.kimi_k31.gfx950.stages.tile import atomic_lin
 
 SOURCES = kernel_sources(__name__)
 
-STOPS = ("kda", "reduce", "fgate")
+STOPS = ("kda", "reduce", "fgate", "route")
 
 # o_proj [rows, 2048] x [4096, 2048]^T, the fastest direct-to-LDS cfg a width (dma_bench)
 OPROJ = {
@@ -63,7 +65,7 @@ def oproj_cfg(rows):
 
 def scratch_layout(rows, tt, trace=False):
     """Word offsets in the (local) scratch buffer."""
-    g, go = inproj_cfg(rows), oproj_cfg(rows)
+    g, go, gr = inproj_cfg(rows), oproj_cfg(rows), route.rgate_cfg(rows)
     offs, w = {}, 0
 
     def take(name, words, align=32):
@@ -79,6 +81,8 @@ def scratch_layout(rows, tt, trace=False):
     take("xfflag", rows)
     take("pmix_a", 2 * mhc.pmix_words(rows))
     take("pmix_f", 2 * mhc.pmix_words(rows))
+    take("cnt_r", CNT_STRIDE * route.n_tiles(gr) * -(-rows // gr.bm))
+    take("parts", gr.ks * rows * N_EXPERTS)
     if trace:
         take("trace", BLOCKS * TRACE_POINTS * 2)
     offs["end"] = w
@@ -96,9 +100,12 @@ def _poll_peer(c, n, region, idx):
 _BUILDS: dict = {}
 
 
-def build(rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="fgate", trace=False):
+def build(
+    rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="route", trace=False,
+    shared_w=1.0,
+):
     keyed = key_tuple(locals(), SOURCES)
-    key = (rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop, trace)
+    key = (rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop, trace, shared_w)
     if key in _BUILDS:
         return _BUILDS[key]
     assert rows % tt == 0 and stop in STOPS
@@ -116,6 +123,9 @@ def build(rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="fgate"
     ct_o = sl // go.bn
     n_pieces = coll.pieces(rows, rb_o, go.bn, tp)
     n_seam = mhc.tasks(rows)
+    gr = route.rgate_cfg(rows)
+    ntr, tmr = route.n_tiles(gr), -(-rows // gr.bm)
+    n_router = ntr * gr.ks * tmr
     br = rows // mhc.bands(rows)
     sc = scratch_layout(rows, tt, trace)
     poffs, half = coll.layout(rows, rb_o, go.bn, tp)
@@ -129,8 +139,8 @@ def build(rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="fgate"
         fl: fx.Array[fx.Float32, lw["fl"], 16]
         red: fx.Array[fx.Float32, lw["red"], 16]
 
-    gemm_words = max(c.stages * (c.bm + c.bn) * c.bk // 2 for c in (g, go))
-    c_words = max(c.bm * (c.bn + 4) for c in (g, go))
+    gemm_words = max(c.stages * (c.bm + c.bn) * c.bk // 2 for c in (g, go, gr))
+    c_words = max([c.bm * (c.bn + 4) for c in (g, go)] + [route.RED_WORDS])
 
     @fx.struct
     class GemmLds:
@@ -168,6 +178,7 @@ def build(rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="fgate"
         w_o: I64, acc_o: I64,
         hc_fn_f: I64, hc_scale_f: I64, hc_base_f: I64, norm_w_f: I64, res_mid: I64,
         x_f: I64, post_f: I64, comb_f: I64,
+        w_r: I64, bias_r: I64, ids: I64, wts: I64,
         epoch: I64, scratch: I64, peers: I64, rank: I32,
         cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32, iw_win: I32,
         rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32, ring_len: I32,
@@ -340,6 +351,37 @@ def build(rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="fgate"
             for t in range(first_task(bid, base), rows, BLOCKS):
                 mhc.gate_row(mcf, t)
             stamp(8)
+        if const_expr(level >= 3):
+            # ---- router: (column tile, K slice, row tile) tasks
+            base += rows
+            ktr = HIDDEN // gr.ks
+            parts = scratch + fx.Int64(sc["parts"] * 4)
+            cnt_r = scratch + fx.Int64(sc["cnt_r"] * 4)
+            for task in range(first_task(bid, base), n_router, BLOCKS):
+                nt = task % ntr
+                sk = (task // ntr) % gr.ks
+                mt = task // (ntr * gr.ks)
+                m0 = mt * gr.bm
+                tile_dma.dma_tile(
+                    tid, x_f, HIDDEN, rows, m0, w_r, HIDDEN, N_EXPERTS, nt * gr.bn,
+                    sk * ktr, ktr, gr.bm, gr.bn, gr.wm, gr.wn, ab,
+                    route.part_emit(parts, rows, sk, nt * gr.bn), gr.bk, gr.stages, None,
+                    cl, CM_DEV,
+                    wait_x=lambda: _wait_words(
+                        tid, fx.min(gr.bm, rows - m0), scratch, sc["xfflag"] + m0 + tid, ep + 1
+                    ),
+                )
+                _count(tid, cnt_r + fx.Int64((mt * ntr + nt) * CNT_STRIDE * 4))
+            stamp(10)
+            # ---- route
+            base += n_router
+            for t in range(first_task(bid, base), rows, BLOCKS):
+                _wait_words(
+                    tid, ntr, scratch, sc["cnt_r"] + ((t // gr.bm) * ntr + tid) * CNT_STRIDE,
+                    (ep + 1) * gr.ks,
+                )
+                route.route_row(tid, t, rows, gr.ks, parts, bias_r, ids, wts, cl, shared_w)
+            stamp(11)
         epoch_end(cb, epoch, ep)
         stamp(9)
 
@@ -354,6 +396,7 @@ def build(rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="fgate"
         w_o: I64, acc_o: I64,
         hc_fn_f: I64, hc_scale_f: I64, hc_base_f: I64, norm_w_f: I64, res_mid: I64,
         x_f: I64, post_f: I64, comb_f: I64,
+        w_r: I64, bias_r: I64, ids: I64, wts: I64,
         epoch: I64, scratch: I64, peers: I64, rank: I32,
         cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32, iw_win: I32,
         rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32, ring_len: I32,
@@ -364,14 +407,16 @@ def build(rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="fgate"
             res_in, hc_fn_a, hc_scale_a, hc_base_a, norm_w_a, x_a, post_a, comb_a, w_in, proj,
             conv_w, conv_st, cs_idx, iw, iw_idx, w_fgb, a_log, dt_bias, state, h0_idx, rawv,
             rawk, ring_g, ring_beta, ring_idx, on_w, core, w_o, acc_o, hc_fn_f, hc_scale_f,
-            hc_base_f, norm_w_f, res_mid, x_f, post_f, comb_f, epoch, scratch, peers, rank,
+            hc_base_f, norm_w_f, res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, epoch,
+            scratch, peers, rank,
             cs_line, cs_tok, iw_line, iw_step, iw_win, rawv_slot, rawk_slot, g_slot,
             beta_slot, ring_len,
         ).launch(grid=(BLOCKS, 1, 1), block=(THREADS,), stream=stream)
 
     launch.plan = dict(
         rows=rows, gemm=g, oproj=go, rb_o=rb_o, n_seam=n_seam, n_inproj=n_inproj,
-        n_kda=reqs * kda.NH, n_oproj=n_oproj, n_pieces=n_pieces, scratch_words=sc["end"],
+        n_kda=reqs * kda.NH, n_oproj=n_oproj, n_pieces=n_pieces, rgate=gr,
+        n_router=n_router, scratch_words=sc["end"],
         epoch_words=EPOCH_MARKS + BLOCKS, peer_bytes=coll.peer_bytes(rows, rb_o, go.bn, tp),
     )
     _BUILDS[key] = launch
