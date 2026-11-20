@@ -129,7 +129,16 @@ def _slice_loads(c, c0, tb, u):
         return (_ld_row8(a["res_in"], (t * HC + o) * HIDDEN + col, ccm),)
     r = [_ld_row8(a["res_in"], (t * HC + i) * HIDDEN + col, ccm) for i in range(HC)]
     cm = [ld_f32(a["comb_in"], (t * HC + i) * HC + o, ccm) for i in range(HC)]
-    x = _ld_row8(a["x_in"], t * HIDDEN + col, c.get("x_cm", ccm))
+    if const_expr(a.get("x_parts") is None):
+        x = _ld_row8(a["x_in"], t * HIDDEN + col, c.get("x_cm", ccm))
+    else:
+        # x is the bf16 sum, in rank order, of tp bf16 planes of plane elements
+        tp, plane = a["x_parts"]
+        xs = [_ld_row8(a["x_in"], p * plane + t * HIDDEN + col, c.get("x_cm", ccm)) for p in range(tp)]
+        x = xs[0]
+        for p in range_constexpr(1, tp):
+            x = [x[q] + xs[p][q] for q in range(VEC)]
+        x = [bf16_round(v) for v in x]
     return r, cm, ld_f32(a["post_in"], t * HC + o, ccm), x
 
 
