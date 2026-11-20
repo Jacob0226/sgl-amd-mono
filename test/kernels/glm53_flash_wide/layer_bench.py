@@ -2,6 +2,8 @@
 """Wide layer launch (``glm53_flash.gfx950.wide.layer``) on ``tp`` gfx950 GPUs against
 torch / the standalone stages:
 
+    R_in    (``--t1``) ``_mhc_post_torch`` of the rank-order sum of the MoE partials
+            (bitwise); then the residual every check below uses
     core    the KDA task (``kda.standalone``) on the launch's own proj (bitwise)
     o       sum over ranks of core_r @ W_o,r^T (bf16 tolerance); every rank the same bits
     R_mid   ``_mhc_post_torch`` of the launch's o (bitwise)
@@ -60,6 +62,11 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
         return (torch.randn(*s, device=dev, generator=g) * scale).to(dt)
 
     res_in = rnd(m, HC, HIDDEN, dt=torch.bfloat16)
+    # t1: res_in is the previous layer's R_mid; its post_f / comb_f; each rank's MoE partial
+    post_p = torch.rand(m, HC, device=dev, generator=gen) * 2
+    comb_p = torch.rand(m, HC * HC, device=dev, generator=gen) / 2
+    moe_in = rnd(m, HIDDEN, scale=0.5, dt=torch.bfloat16,
+                 g=torch.Generator(device=dev).manual_seed(7000 + rank))
     mhc_w = []
     for _ in range(2):
         mhc_w.append(dict(
@@ -105,9 +112,10 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     res_mid = z(m, HC, HIDDEN, dt=torch.bfloat16)
     x_f, post_f, comb_f = z(m, HIDDEN, dt=torch.bfloat16), z(m, HC), z(m, HC * HC)
     ids, wts, logits = z(m, MOE_SLOTS, dt=torch.int32), z(m, MOE_SLOTS), z(m, N_EXPERTS)
+    res_cur = z(m, HC, HIDDEN, dt=torch.bfloat16)
     launch = layer.build(
         m, tt, tp, LB, ONORM_EPS, bool(sbf), True, a.stop, trace=a.trace,
-        oneshot=m <= a.oneshot_rows,
+        oneshot=m <= a.oneshot_rows, t1=a.t1,
     )
     plan = launch.plan
     epoch = z(plan["epoch_words"], dt=torch.int32)
@@ -123,7 +131,8 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             w_in, proj, conv_w, conv_st, cs_idx, mine["iw"], idx, w_fgb, a_log, dt_bias,
             state, idx, mine["rawv"], mine["rawk"], mine["ring_g"], mine["ring_beta"], idx,
             on_w, mine["core"], w_o, acc_o, ff["fn"], ff["scale"], ff["base"], ff["norm"],
-            res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, logits, epoch, scratch)
+            res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, logits, moe_in, post_p, comb_p,
+            res_cur, epoch, scratch)
     pl = [t.data_ptr() for t in ptrs] + [peers.addresses.data_ptr(), rank]
 
     def go():
@@ -133,6 +142,20 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     go()
     torch.cuda.synchronize()
     errs = {}
+    fa, ff = mhc_w
+    r_attn = res_in
+    if a.t1:
+        moes = gather(moe_in)
+        msum = moes[0].float()
+        for t in moes[1:]:
+            msum = msum + t.float()
+        errs["R_in"] = rel(res_cur, mhc_post_ref(msum.to(torch.bfloat16), res_in, post_p, comb_p))
+        errs["rin_ranks"] = max(float((t != res_cur).any()) for t in gather(res_cur))
+        r_attn = res_cur
+    pa_ref, ca_ref, lia = mhc_pre_ref(r_attn, fa["fn"], fa["scale"], fa["base"])
+    errs["x_a"] = rel(x_a, rmsnorm_ref(lia, fa["norm"]))
+    errs["post_a"] = rel(post_a, pa_ref)
+    errs["comb_a"] = rel(comb_a, ca_ref)
     # core: the KDA task alone on our proj
     kl = kda.standalone(reqs, tt, LB, ONORM_EPS, bool(sbf), True)
     kp = (proj, conv_w, conv_st, cs_idx, ref["iw"], idx, w_fgb, a_log, dt_bias, state, idx,
@@ -142,7 +165,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     errs["core"] = rel(mine["core"], ref["core"])
     errs["proj"] = rel(proj, (x_a.float() @ w_in.float().T).to(torch.bfloat16))
     if a.stop != "kda":
-        offs, half = coll.layout(m, plan["rb_o"], plan["oproj"].bn, tp, plan["oneshot"])
+        offs, half = coll.layout(m, plan["rb_o"], plan["oproj"].bn, tp, plan["oneshot"], plan["t1"])
         par = (epoch[0].item() - 1) % 2
         if plan["oneshot"]:
             os_ = peers.bytes[par * half + offs["os"] :][: tp * m * HIDDEN * 2]
@@ -159,7 +182,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
         errs["o"] = rel(o, o_ref)
         errs["o_ranks"] = max(float((t != o).any()) for t in gather(o))
         if layer.STOPS.index(a.stop) >= 2:
-            r_ref = mhc_post_ref(o, res_in, post_a, comb_a)
+            r_ref = mhc_post_ref(o, r_attn, post_a, comb_a)
             errs["R_mid"] = rel(res_mid, r_ref)
             p_ref, c_ref, li_ref = mhc_pre_ref(res_mid, ff["fn"], ff["scale"], ff["base"])
             xr = rmsnorm_ref(li_ref, ff["norm"])
@@ -211,7 +234,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             if col.numel() and rank == 0:
                 print(f"    {nm:>7}  median {col.median():6.2f}  max {col.max():6.2f} us", flush=True)
     peers.close()
-    tol = {"core": 1e-6, "proj": 1e-2, "o": 1e-2, "o_ranks": 0.0, "R_mid": 1e-6, "x_f": 1e-3,
+    tol = {"R_in": 1e-6, "rin_ranks": 0.0, "x_a": 1e-3, "post_a": 1e-5, "comb_a": 1e-5, "core": 1e-6, "proj": 1e-2, "o": 1e-2, "o_ranks": 0.0, "R_mid": 1e-6, "x_f": 1e-3,
            "post_f": 1e-5, "comb_f": 1e-5, "xf_ranks": 0.0, "ids_bad": 0, "w": 1e-5, "logits": 1e-5,
            "shared": 0, "route_ranks": 0.0}
     return all(errs[k] <= v for k, v in tol.items() if k in errs)
@@ -244,6 +267,7 @@ def main():
     ap.add_argument("--launches", type=int, default=10)
     ap.add_argument("--time", action="store_true")
     ap.add_argument("--oneshot-rows", type=int, default=0)
+    ap.add_argument("--t1", action="store_true")
     ap.add_argument("--trace", action="store_true")
     a = ap.parse_args()
     rank = int(os.environ["RANK"])

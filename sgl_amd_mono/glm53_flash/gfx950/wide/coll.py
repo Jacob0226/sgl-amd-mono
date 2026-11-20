@@ -38,9 +38,16 @@ def full_pieces(rows, rb, bn):
     return -(-rows // rb) * (HIDDEN // bn)
 
 
-def layout(rows, rb, bn, tp, oneshot=False):
-    """Byte offsets of one parity half and the half's size."""
+def layout(rows, rb, bn, tp, oneshot=False, t1=False):
+    """Byte offsets of one parity half and the half's size. ``t1``: a second two-shot
+    set (``t_`` names) for the launch's entry all-reduce."""
     sizes = {}
+    if t1:
+        sl = HIDDEN // tp
+        sizes["t_rs"] = tp * rows * sl * 2
+        sizes["t_ag"] = rows * HIDDEN * 2
+        sizes["t_fl"] = tp * BLOCKS * 8
+        sizes["t_agf"] = tp * pieces(rows, rb, bn, tp) * 8
     if oneshot:
         sizes["os"] = tp * rows * HIDDEN * 2
         sizes["osf"] = tp * full_pieces(rows, rb, bn) * 8
@@ -57,8 +64,37 @@ def layout(rows, rb, bn, tp, oneshot=False):
     return offs, (w + 255) // 256 * 256
 
 
-def peer_bytes(rows, rb, bn, tp, oneshot=False):
-    return 2 * layout(rows, rb, bn, tp, oneshot)[1] + guard.FLAG_BYTES
+def peer_bytes(rows, rb, bn, tp, oneshot=False, t1=False):
+    return 2 * layout(rows, rb, bn, tp, oneshot, t1)[1] + guard.FLAG_BYTES
+
+
+def prefixed(c, pre, names=("rs", "ag", "fl", "agf")):
+    """A view of region context ``c`` whose ``<name>_of`` / ``<name>_own`` are ``c``'s
+    ``<pre><name>`` ones (the shared helpers then work on a second region set)."""
+    v = _View({k: c[k] for k in ("tid", "bid", "rank", "put", "put_words", "poll")})
+    for n in names:
+        v[f"{n}_of"] = c[f"{pre}{n}_of"]
+        v.lazy[f"{n}_own"] = lambda n=n: c[f"{pre}{n}_own"]
+    return v
+
+
+class _View(dict):
+    """``_own`` entries formed at each use, as in ``region_context``."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.lazy = {}
+
+    def __getitem__(self, k):
+        if not dict.__contains__(self, k) and k in self.lazy:
+            return self.lazy[k]()
+        return super().__getitem__(k)
+
+    def __contains__(self, k):
+        return dict.__contains__(self, k) or k in self.lazy
+
+    def get(self, k, default=None):
+        return self[k] if k in self else default
 
 
 @flyc.jit
