@@ -198,47 +198,57 @@ def kda_head(c, n, hv, lds):
     c["wait_proj"](n, hv)
     if const_expr("stamp" in c):
         c["stamp"](8)
-    # f_b / g_b: wave w's MFMA gives rows 16 w .. of both for the TT tokens (bf16 out)
+    # every proj load goes out together: one round trip
     t = fx.min(lane % 16, TT - 1)
+    xbs = [
+        [
+            fx.Vector(
+                _load(x, ((bos + t) * xs_ + col0 + (lane // 16) * 32 + 8 * q) // 2, T.i32, 4, pcm)
+            )
+            for q in range(4)
+        ]
+        for col0 in (FA_0, GA_0)
+    ]
+    xw += [fx.BFloat16(_load(x, (bos + tt) * xs_ + qk_ch, T.bf16, 1, pcm)) for tt in range(TT)]
+    vw += [fx.BFloat16(_load(x, (bos + tt) * xs_ + v_ch, T.bf16, 1, pcm)) for tt in range(TT)]
+    b_row = bos + fx.min(ch, TT - 1)
+    bb = fx.Float32(fx.BFloat16(_load(x, b_row * xs_ + BETA_0 + hv, T.bf16, 1, pcm)))
+    # f_b / g_b: wave w's MFMA gives rows 16 w .. of both for the TT tokens (bf16 out)
     for which in range_constexpr(2):
-        col0 = FA_0 if which == 0 else GA_0
         gacc = fx.Vector.filled(4, 0.0, fx.Float32)
         for q in range_constexpr(4):
-            kb = (lane // 16) * 32 + 8 * q
-            xb = fx.Vector(_load(x, ((bos + t) * xs_ + col0 + kb) // 2, T.i32, 4, pcm))
-            gacc = mfma_bf16(gw[which][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), gacc)
+            gacc = mfma_bf16(
+                gw[which][q].bitcast(fx.BFloat16), xbs[which][q].bitcast(fx.BFloat16), gacc
+            )
         dst = s_fa if which == 0 else s_ga
         for i in range_constexpr(4):
             kk = wave * 16 + 4 * (lane // 16) + i
             if lane % 16 < TT:
                 fx.ptr_store(fx.Float32(fx.Float32(gacc[i]).to(fx.BFloat16)), dst + (t * KD + kk))
-    xw += [fx.BFloat16(_load(x, (bos + tt) * xs_ + qk_ch, T.bf16, 1, pcm)) for tt in range(TT)]
-    vw += [fx.BFloat16(_load(x, (bos + tt) * xs_ + v_ch, T.bf16, 1, pcm)) for tt in range(TT)]
-    b_row = bos + fx.min(ch, TT - 1)
-    bb = fx.Float32(fx.BFloat16(_load(x, b_row * xs_ + BETA_0 + hv, T.bf16, 1, pcm)))
     gpu.barrier()
     if const_expr("stamp" in c):
         c["stamp"](9)
 
     # conv + silu, rounded to bf16 as the unfused path stores it
-    qk = []
+    qk, rk_bf = [], []
     wql = [wq[i] for i in range(4)]
     qk_row = is_k.select(fx.Int32(TT * KD), fx.Int32(0))
     rawk_base = a["rawk"] + ring_c * fx.Int64(a["rawk_slot"]) * 2
     for tt in range_constexpr(TT):
         r = _conv_silu(xw[tt : tt + 4], wql)
         qk.append(fx.Float32(r))
+        rk_bf.append(r)
         fx.ptr_store(fx.Float32(r), s_qk + (qk_row + tt * KD + ch))
-        if is_k & qk_owner & ring_ok & (fx.Int32(tt) < L):
-            bo.buffer_store(r, rsrc(rawk_base), (hv * L + tt) * KD + ch)
+    if const_expr("stamp" in c):
+        c["stamp"](13)
     wvl = [wv[i] for i in range(4)]
     rawv_base = a["rawv"] + ring_c * fx.Int64(a["rawv_slot"]) * 2
     if has_v:
         for tt in range_constexpr(TT):
             r = _conv_silu(vw[tt : tt + 4], wvl)
             fx.ptr_store(fx.Float32(r), s_v + (tt * BVC + ch))
-            if ring_ok & (fx.Int32(tt) < L):
-                bo.buffer_store(r, rsrc(rawv_base), (hv * L + tt) * KD + v0 + ch)
+    if const_expr("stamp" in c):
+        c["stamp"](14)
     g_base = a["ring_g"] + ring_c * fx.Int64(a["g_slot"]) * 4
     lb = fx.Float32(c["lower_bound"])
     if _uniform(th) < KD:
@@ -247,27 +257,12 @@ def kda_head(c, n, hv, lds):
             y = ea * (fx.ptr_load(s_fa + (tt * KD + ch)) + dtb)
             g = lb * (fx.Float32(1.0) / (fx.Float32(1.0) + _tl_exp(-y)))
             fx.ptr_store(_tl_exp(g), s_dec + (tt * KD + ch))
-            if qk_owner & ring_ok & (fx.Int32(tt) < L):
-                bo.buffer_store(g, rsrc(g_base), (hv * L + tt) * KD + ch)
     beta_base = a["ring_beta"] + ring_c * fx.Int64(a["beta_slot"]) * 4
     if is_k & (ch < TT):
         beta = fx.Float32(1.0) / (fx.Float32(1.0) + _tl_exp(-bb))
         fx.ptr_store(beta, s_beta + ch)
-        if qk_owner & ring_ok & (ch < L):
-            bo.buffer_store(beta, rsrc(beta_base), hv * L + ch)
-    if const_expr(c["has_iw"]):
-        iw_slot = _load_uniform(a["iw_idx"], n)
-        iw_base = a["iw"] + fx.Int64(fx.max(iw_slot, 0)) * fx.Int64(a["iw_line"]) * 2
-        iw_ok = live & (iw_slot >= 0)
-        iw_step, iw_win = a["iw_step"], a["iw_win"]
-        if iw_ok & qk_owner:
-            for tt in range_constexpr(TT):
-                for j in range_constexpr(3):
-                    bo.buffer_store(xw[tt + 1 + j], rsrc(iw_base), tt * iw_step + qk_ch + j * iw_win)
-        if iw_ok & has_v:
-            for tt in range_constexpr(TT):
-                for j in range_constexpr(3):
-                    bo.buffer_store(vw[tt + 1 + j], rsrc(iw_base), tt * iw_step + v_ch + j * iw_win)
+    if const_expr("stamp" in c):
+        c["stamp"](15)
     # l2 norm sums of squares: waves 0-1 of a half hold the q rows, waves 2-3 the k rows
     ss = [_wave_sum(qk[tt] * qk[tt]) for tt in range(TT)]
     if th % 64 == 0:
@@ -351,6 +346,38 @@ def kda_head(c, n, hv, lds):
                 ((bos + tt) * P + hv * KD + e0) // 2,
                 cache_modifier=out_cm,
             )
+
+    # the ring and conv window, off core_out's path (the accept step reads them)
+    for tt in range_constexpr(TT):
+        if is_k & qk_owner & ring_ok & (fx.Int32(tt) < L):
+            bo.buffer_store(rk_bf[tt], rsrc(rawk_base), (hv * L + tt) * KD + ch)
+    if has_v & ring_ok:
+        for tt in range_constexpr(TT):
+            if fx.Int32(tt) < L:
+                r = fx.ptr_load(s_v + (tt * BVC + ch)).to(fx.BFloat16)
+                bo.buffer_store(r, rsrc(rawv_base), (hv * L + tt) * KD + v0 + ch)
+    if (_uniform(th) < KD) & qk_owner & ring_ok:
+        ea2 = _tl_exp(a_log)
+        for tt in range_constexpr(TT):
+            if fx.Int32(tt) < L:
+                y = ea2 * (fx.ptr_load(s_fa + (tt * KD + ch)) + dtb)
+                g = lb * (fx.Float32(1.0) / (fx.Float32(1.0) + _tl_exp(-y)))
+                bo.buffer_store(g, rsrc(g_base), (hv * L + tt) * KD + ch)
+    if is_k & (ch < TT) & qk_owner & ring_ok & (ch < L):
+        bo.buffer_store(fx.ptr_load(s_beta + ch), rsrc(beta_base), hv * L + ch)
+    if const_expr(c["has_iw"]):
+        iw_slot = _load_uniform(a["iw_idx"], n)
+        iw_base = a["iw"] + fx.Int64(fx.max(iw_slot, 0)) * fx.Int64(a["iw_line"]) * 2
+        iw_ok = live & (iw_slot >= 0)
+        iw_step, iw_win = a["iw_step"], a["iw_win"]
+        if iw_ok & qk_owner:
+            for tt in range_constexpr(TT):
+                for j in range_constexpr(3):
+                    bo.buffer_store(xw[tt + 1 + j], rsrc(iw_base), tt * iw_step + qk_ch + j * iw_win)
+        if iw_ok & has_v:
+            for tt in range_constexpr(TT):
+                for j in range_constexpr(3):
+                    bo.buffer_store(vw[tt + 1 + j], rsrc(iw_base), tt * iw_step + v_ch + j * iw_win)
     gpu.barrier()
     if const_expr("stamp" in c):
         c["stamp"](12)
