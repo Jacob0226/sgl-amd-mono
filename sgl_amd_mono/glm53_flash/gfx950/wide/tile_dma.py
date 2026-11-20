@@ -111,12 +111,16 @@ def dma_tile(
     cl=None,
     xcm=0,
     wrow=None,
+    wait_x=None,
 ):
     """One task: K columns k0 .. k0 + kt of the [bm, bn] tile at (m0, n0) through
     the LDS ring ``ab`` (``lds_words(bm, bn, bk, stages)`` i32 words). ``emit(row,
     col, v, live)`` gets 4 output columns n0 + col .. of token row ``row``; with
     ``lin`` the tile is shuffled through the f32 LDS ``cl`` (aliasing ``ab``) into
-    lane-contiguous adds. ``xcm``: x's cache policy; W loads are nontemporal."""
+    lane-contiguous adds. ``xcm``: x's cache policy; W loads are nontemporal.
+    ``wait_x()``: x is not ready yet: the first stages - 1 W slabs go out before it
+    returns (their own asyncmark groups, ahead of the x slabs': a step still waits
+    for all but the last stages - 2 groups)."""
     assert wm * wn == WAVES and kt % bk == 0 and bk in (64, 128)
     lane, wave = tid % 64, tid // 64
     tm, tn = bm // wm, bn // wn
@@ -131,9 +135,15 @@ def dma_tile(
     sw = xw + ww
     acc = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nt)] for _ in range(mt)]
 
-    def load(j, s):
+    def load_w(j, s):
         _dma(tid, wr, ldw, n, n0, k0 + j * bk, bn, bk, ab + s * sw + xw, CM_NT, wrow)
+
+    def load_x(j, s):
         _dma(tid, xr, ldx, m, m0, k0 + j * bk, bm, bk, ab + s * sw, xcm)
+
+    def load(j, s):
+        load_w(j, s)
+        load_x(j, s)
 
     def compute(s):
         for kk in range_constexpr(bk // 32):
@@ -149,9 +159,18 @@ def dma_tile(
                     acc[t][b] = mfma_bf16(a[b].bitcast(fx.BFloat16), xb, acc[t][b])
 
     pre = min(stages - 1, steps)
-    for j in range_constexpr(pre):
-        load(j, j)
-        rocdl.asyncmark()
+    if const_expr(wait_x is None):
+        for j in range_constexpr(pre):
+            load(j, j)
+            rocdl.asyncmark()
+    else:
+        for j in range_constexpr(pre):
+            load_w(j, j)
+            rocdl.asyncmark()
+        wait_x()
+        for j in range_constexpr(pre):
+            load_x(j, j)
+            rocdl.asyncmark()
     rocdl.sched_barrier(0)
     for j in range_constexpr(steps):
         ahead = j + stages - 1
