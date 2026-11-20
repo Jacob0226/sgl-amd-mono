@@ -30,7 +30,7 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import butterfly, mfma_bf16, rsrc
-from sgl_amd_mono.common.plan import THREADS
+from sgl_amd_mono.common.plan import THREADS, kernel_sources, key_tuple
 
 KD = 128
 NH = 16
@@ -346,6 +346,8 @@ def kda_head(c, n, hv, lds):
                 ((bos + tt) * P + hv * KD + e0) // 2,
                 cache_modifier=out_cm,
             )
+    if const_expr("head_done" in c):
+        c["head_done"](n, hv)
 
     # the ring and conv window, off core_out's path (the accept step reads them)
     for tt in range_constexpr(TT):
@@ -384,6 +386,7 @@ def kda_head(c, n, hv, lds):
 
 
 # ---------------------------------------------------------------- standalone
+SOURCES = kernel_sources(__name__)
 _BUILDS: dict = {}
 
 ARGS = (
@@ -396,6 +399,7 @@ IARGS = ("cs_line", "cs_tok", "iw_line", "iw_step", "iw_win", "rawv_slot", "rawk
 
 def standalone(reqs, tt, lower_bound, onorm_eps, state_bf16, has_iw):
     """Grid (reqs * NH): one task a CTA."""
+    keyed = key_tuple(locals(), SOURCES)
     key = (reqs, tt, lower_bound, onorm_eps, state_bf16, has_iw)
     if key in _BUILDS:
         return _BUILDS[key]
@@ -441,6 +445,7 @@ def standalone(reqs, tt, lower_bound, onorm_eps, state_bf16, has_iw):
                core_out: I64, cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32,
                iw_win: I32, rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32,
                ring_len: I32, stream: fx.Stream = fx.Stream(None)):  # noqa: B008
+        _ = keyed
         kernel(proj, conv_w, conv_st, cs_idx, iw, iw_idx, w_fgb, a_log, dt_bias, state,
                h0_idx, rawv, rawk, ring_g, ring_beta, ring_idx, on_w, core_out, cs_line,
                cs_tok, iw_line, iw_step, iw_win, rawv_slot, rawk_slot, g_slot, beta_slot,

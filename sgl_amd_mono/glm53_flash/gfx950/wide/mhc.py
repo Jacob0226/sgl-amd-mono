@@ -38,7 +38,7 @@ from sgl_amd_mono.common.ops import (
     hw_rsq,
     rsrc,
 )
-from sgl_amd_mono.common.plan import THREADS, WAVES
+from sgl_amd_mono.common.plan import THREADS, WAVES, kernel_sources, key_tuple
 from sgl_amd_mono.glm53_flash.gfx950.config import (
     EPS,
     HC_EPS,
@@ -75,8 +75,8 @@ def pmix_words(s):
     return SLICES * s * PART
 
 
-def ld_f32(ptr, i):
-    return fx.Float32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.f32))
+def ld_f32(ptr, i, cm=0):
+    return fx.Float32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.f32, cache_modifier=cm))
 
 
 def ld_bf(ptr, i):
@@ -109,9 +109,9 @@ def tasks(s):
     return SLICES * bands(s)
 
 
-def _ld_row8(ptr, elem):
+def _ld_row8(ptr, elem, cm=0):
     """bf16 elements elem .. elem + 7 -> 8 f32."""
-    w = fx.Vector(bo.buffer_load(rsrc(ptr), elem // 2, vec_width=4, dtype=T.i32))
+    w = fx.Vector(bo.buffer_load(rsrc(ptr), elem // 2, vec_width=4, dtype=T.i32, cache_modifier=cm))
     return [v for e in range(4) for v in bf2_f32(fx.Int32(w[e]))]
 
 
@@ -124,11 +124,13 @@ def _slice_at(c0, tb, u):
 def _slice_loads(c, c0, tb, u):
     a = c["args"]
     t, _, o, col = _slice_at(c0, tb, u)
+    ccm = c.get("cm", 0)
     if const_expr(a.get("x_in") is None):
-        return (_ld_row8(a["res_in"], (t * HC + o) * HIDDEN + col),)
-    r = [_ld_row8(a["res_in"], (t * HC + i) * HIDDEN + col) for i in range(HC)]
-    cm = [ld_f32(a["comb_in"], (t * HC + i) * HC + o) for i in range(HC)]
-    return r, cm, ld_f32(a["post_in"], t * HC + o), _ld_row8(a["x_in"], t * HIDDEN + col)
+        return (_ld_row8(a["res_in"], (t * HC + o) * HIDDEN + col, ccm),)
+    r = [_ld_row8(a["res_in"], (t * HC + i) * HIDDEN + col, ccm) for i in range(HC)]
+    cm = [ld_f32(a["comb_in"], (t * HC + i) * HC + o, ccm) for i in range(HC)]
+    x = _ld_row8(a["x_in"], t * HIDDEN + col, c.get("x_cm", ccm))
+    return r, cm, ld_f32(a["post_in"], t * HC + o, ccm), x
 
 
 def _slice_row(c, c0, tb, u, got):
@@ -149,6 +151,7 @@ def _slice_row(c, c0, tb, u, got):
             fx.Vector.from_elements(v, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32),
             rsrc(a["res_out"]),
             ((t * HC + o) * HIDDEN + col) // 2,
+            cache_modifier=c.get("cm", 0),
         )
     dst = c["rl"] + (tl * KS + o * COLS + col - c0)
     for h in range_constexpr(2):
@@ -194,6 +197,9 @@ def slice_task(c, task):
         lambda u: _slice_loads(c, c0, tb, u),
         lambda u, got: _slice_row(c, c0, tb, u, got),
     )
+    if const_expr(c["args"].get("x_in") is not None):
+        # R' out before any partial is published: the gate reads it after the partials
+        rocdl.s_waitcnt(vmcnt=0)
     for i in range_constexpr(len(fn)):
         q = tid + THREADS * i
         if q < MIX * KT // 4:
@@ -270,17 +276,28 @@ def gate_row(c, t):
     red = c["red"]
     a = c["args"]
     r_src = a["res_out"] if const_expr(a.get("x_in") is not None) else a["res_in"]
+    ccm = c.get("cm", 0)
     groups = SLICES // GATE_BLOCK
-    # this thread's columns of the 4 streams and the norm weights do not wait on the mixes
     col = tid * CPT
-    rw = [
-        fx.Vector(
-            bo.buffer_load(
-                rsrc(r_src), ((t * HC + i) * HIDDEN + col) // 2, vec_width=CPT // 2, dtype=T.i32
+
+    def load_rows():
+        return [
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(r_src),
+                    ((t * HC + i) * HIDDEN + col) // 2,
+                    vec_width=CPT // 2,
+                    dtype=T.i32,
+                    cache_modifier=ccm,
+                )
             )
-        )
-        for i in range(HC)
-    ]
+            for i in range(HC)
+        ]
+
+    # R_in and the norm weights do not wait on the mixes; R' (the slices' output in
+    # this launch) only once its partials are in
+    post_in = a.get("x_in") is not None
+    rw = None if post_in else load_rows()
     gw = fx.Vector(
         bo.buffer_load(rsrc(a["norm_w"]), col // 2, vec_width=CPT // 2, dtype=T.i32)
     )
@@ -297,6 +314,8 @@ def gate_row(c, t):
             acc = acc + vals[k]
         fx.ptr_store(acc, red + (g * PART + j))
     gpu.barrier()
+    if const_expr(post_in):
+        rw = load_rows()
     sv = red + groups * PART  # pre [HC] | ss [WAVES] | v [64]
     if wave == 0:
         # lanes 0..7 pre and post, COMB0.. comb (the lanes between repeat 0..7)
@@ -311,7 +330,7 @@ def gate_row(c, t):
             fx.ptr_store(sigmoid(v * sc[0] + base) + HC_EPS, sv + lane)
         if (lane >= HC) & (lane < 2 * HC):
             post = sigmoid(v * sc[1] + base) * HC_POST_MULT
-            bo.buffer_store(post, rsrc(a["post_out"]), t * HC + lane - HC)
+            bo.buffer_store(post, rsrc(a["post_out"]), t * HC + lane - HC, cache_modifier=ccm)
     gpu.barrier()
     # the layer input needs only pre: x goes out before Sinkhorn
     pre = [fx.ptr_load(sv + i) for i in range(HC)]
@@ -347,11 +366,12 @@ def gate_row(c, t):
             cv = div(cv, _row_sum(cv) + HC_EPS)
             cv = div(cv, _col_sum(cv) + HC_EPS)
         if (lane >= COMB0) & (lane < COMB0 + HC * HC):
-            bo.buffer_store(cv, rsrc(a["comb_out"]), t * HC * HC + lane - COMB0)
+            bo.buffer_store(cv, rsrc(a["comb_out"]), t * HC * HC + lane - COMB0, cache_modifier=ccm)
     gpu.barrier()
 
 
 # ---------------------------------------------------------------- standalone
+SOURCES = kernel_sources(__name__)
 _BUILDS: dict = {}
 
 
@@ -359,6 +379,7 @@ def standalone(s, post, which="both"):
     """Two launches: slices (grid SLICES), then gates (grid s). ``post``: fold the
     owed hc_post (x_in, post_in, comb_in -> res_out) in front. ``which``: "both",
     "slice" or "gate" (timing one stage)."""
+    keyed = key_tuple(locals(), SOURCES)
     key = (s, post, which)
     if key in _BUILDS:
         return _BUILDS[key]
@@ -421,6 +442,7 @@ def standalone(s, post, which="both"):
                hc_fn: I64, hc_scale: I64, hc_base: I64, norm_w: I64, pmix: I64,
                x_out: I64, post_out: I64, comb_out: I64,
                stream: fx.Stream = fx.Stream(None)):  # noqa: B008
+        _ = keyed
         ptrs = (res_in, res_out, x_in, post_in, comb_in, hc_fn, hc_scale, hc_base,
                 norm_w, pmix, x_out, post_out, comb_out)
         if const_expr(which != "gate"):

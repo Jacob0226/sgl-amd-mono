@@ -23,11 +23,13 @@ from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.epoch import EPOCH_MARKS, epoch_begin, epoch_end
 from sgl_amd_mono.common.ops import CM_DEV, clock, ld_i32, rsrc, uniform
-from sgl_amd_mono.common.plan import BLOCKS, THREADS, first_task
+from sgl_amd_mono.common.plan import BLOCKS, THREADS, first_task, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, _spin, sreg
 from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN
 from sgl_amd_mono.glm53_flash.gfx950.wide import kda, mhc, tile_dma
 from sgl_amd_mono.kimi_k31.gfx950.stages.tile import atomic_lin
+
+SOURCES = kernel_sources(__name__)
 
 
 class Gemm(msgspec.Struct, frozen=True):
@@ -137,6 +139,7 @@ _BUILDS: dict = {}
 
 
 def build(rows, tt, lower_bound, onorm_eps, state_bf16, has_iw, trace=False):
+    keyed = key_tuple(locals(), SOURCES)
     key = (rows, tt, lower_bound, onorm_eps, state_bf16, has_iw, trace)
     if key in _BUILDS:
         return _BUILDS[key]
@@ -307,6 +310,7 @@ def build(rows, tt, lower_bound, onorm_eps, state_bf16, has_iw, trace=False):
         rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32, ring_len: I32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        _ = keyed
         kernel(
             res_in, hc_fn, hc_scale, hc_base, norm_w, x, post_out, comb_out, w_in, proj, conv_w, conv_st,
             cs_idx, iw, iw_idx, w_fgb, a_log, dt_bias, state, h0_idx, rawv, rawk, ring_g,
