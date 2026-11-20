@@ -13,7 +13,8 @@ CTAs, one task loop a stage, no grid barrier) a KDA layer on each of ``tp`` rank
     fseam   FFN mHC slices: R_mid = post o + comb R (hc_post) and their mixes
     fgate   a row's FFN mixes -> post_f / comb_f, the FFN input x_f
     router  split-K f32 partials of x_f @ W_r^T (``route``)
-    route   a row: logits, sigmoid, top-8 + the shared slot -> ids / weights [rows, 9]
+    route   a row: logits [rows, 288] f32, sigmoid, top-8 + the shared slot -> ids /
+            weights [rows, 9]
 
 ``stop`` ends the launch after a stage (``STOPS``). Hand-offs inside a rank: tagged
 mailbox pairs (tag = epoch + 1) for the slice partials, flag words (:= epoch + 1) for
@@ -184,7 +185,7 @@ def build(
         w_o: I64, acc_o: I64,
         hc_fn_f: I64, hc_scale_f: I64, hc_base_f: I64, norm_w_f: I64, res_mid: I64,
         x_f: I64, post_f: I64, comb_f: I64,
-        w_r: I64, bias_r: I64, ids: I64, wts: I64,
+        w_r: I64, bias_r: I64, ids: I64, wts: I64, logits: I64,
         epoch: I64, scratch: I64, peers: I64, rank: I32,
         cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32, iw_win: I32,
         rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32, ring_len: I32,
@@ -404,7 +405,9 @@ def build(
                     (ep + 1) * gr.ks,
                 )
                 stamp(12)
-                route.route_row(tid, t, rows, gr.ks, parts, bias_r, ids, wts, cl, shared_w)
+                route.route_row(
+                    tid, t, rows, gr.ks, parts, bias_r, ids, wts, logits, cl, shared_w
+                )
             stamp(11)
         epoch_end(cb, epoch, ep)
         stamp(9)
@@ -420,7 +423,7 @@ def build(
         w_o: I64, acc_o: I64,
         hc_fn_f: I64, hc_scale_f: I64, hc_base_f: I64, norm_w_f: I64, res_mid: I64,
         x_f: I64, post_f: I64, comb_f: I64,
-        w_r: I64, bias_r: I64, ids: I64, wts: I64,
+        w_r: I64, bias_r: I64, ids: I64, wts: I64, logits: I64,
         epoch: I64, scratch: I64, peers: I64, rank: I32,
         cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32, iw_win: I32,
         rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32, ring_len: I32,
@@ -431,7 +434,7 @@ def build(
             res_in, hc_fn_a, hc_scale_a, hc_base_a, norm_w_a, x_a, post_a, comb_a, w_in, proj,
             conv_w, conv_st, cs_idx, iw, iw_idx, w_fgb, a_log, dt_bias, state, h0_idx, rawv,
             rawk, ring_g, ring_beta, ring_idx, on_w, core, w_o, acc_o, hc_fn_f, hc_scale_f,
-            hc_base_f, norm_w_f, res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, epoch,
+            hc_base_f, norm_w_f, res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, logits, epoch,
             scratch, peers, rank,
             cs_line, cs_tok, iw_line, iw_step, iw_win, rawv_slot, rawk_slot, g_slot,
             beta_slot, ring_len,

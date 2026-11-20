@@ -104,7 +104,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     acc_o = z(m, HIDDEN, dt=torch.bfloat16)
     res_mid = z(m, HC, HIDDEN, dt=torch.bfloat16)
     x_f, post_f, comb_f = z(m, HIDDEN, dt=torch.bfloat16), z(m, HC), z(m, HC * HC)
-    ids, wts = z(m, MOE_SLOTS, dt=torch.int32), z(m, MOE_SLOTS)
+    ids, wts, logits = z(m, MOE_SLOTS, dt=torch.int32), z(m, MOE_SLOTS), z(m, N_EXPERTS)
     launch = layer.build(
         m, tt, tp, LB, ONORM_EPS, bool(sbf), True, a.stop, trace=a.trace,
         oneshot=m <= a.oneshot_rows,
@@ -123,7 +123,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             w_in, proj, conv_w, conv_st, cs_idx, mine["iw"], idx, w_fgb, a_log, dt_bias,
             state, idx, mine["rawv"], mine["rawk"], mine["ring_g"], mine["ring_beta"], idx,
             on_w, mine["core"], w_o, acc_o, ff["fn"], ff["scale"], ff["base"], ff["norm"],
-            res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, epoch, scratch)
+            res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, logits, epoch, scratch)
     pl = [t.data_ptr() for t in ptrs] + [peers.addresses.data_ptr(), rank]
 
     def go():
@@ -173,6 +173,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             errs["xf_ranks"] = max(float((t != x_f).any()) for t in gather(x_f))
         if a.stop == "route":
             errs.update(route_check(x_f, w_r, bias_r, ids, wts))
+            errs["logits"] = rel(logits, x_f.float() @ w_r.float().T)
             errs["route_ranks"] = max(
                 float((t != ids).any()) for t in gather(ids)
             ) + max(float((t != wts).any()) for t in gather(wts))
@@ -211,7 +212,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
                 print(f"    {nm:>7}  median {col.median():6.2f}  max {col.max():6.2f} us", flush=True)
     peers.close()
     tol = {"core": 1e-6, "proj": 1e-2, "o": 1e-2, "o_ranks": 0.0, "R_mid": 1e-6, "x_f": 1e-3,
-           "post_f": 1e-5, "comb_f": 1e-5, "xf_ranks": 0.0, "ids_bad": 0, "w": 1e-5,
+           "post_f": 1e-5, "comb_f": 1e-5, "xf_ranks": 0.0, "ids_bad": 0, "w": 1e-5, "logits": 1e-5,
            "shared": 0, "route_ranks": 0.0}
     return all(errs[k] <= v for k, v in tol.items() if k in errs)
 
