@@ -2,6 +2,10 @@
 """The GLM-5.3-Flash wide layer launch (milestone 1): one persistent launch (BLOCKS
 CTAs, one task loop a stage, no grid barrier) a KDA layer on each of ``tp`` ranks:
 
+    (``t1``: the previous layer's FFN exit first)
+    tpush   this rank's MoE partial, band by band, to the column owners (RS)
+    treduce the owner's pieces summed in rank order, stored on every rank (AG)
+    aseam   (with t1) R_in = post_p moe + comb_p R_mid_p (hc_post) as it reads R
     aseam   attention mHC slices of the replicated residual R_in (and zero ``proj``)
     agate   a row's mixes -> pre / post / comb, the attention input x (RMSNorm)
     inproj  proj = x @ W_in^T (this rank's heads): direct-to-LDS tile GEMM, split-K adds
@@ -99,17 +103,27 @@ def _poll_peer(c, n, region, idx):
     gpu.barrier()
 
 
+def _poll_ag(c, task, rows, br, rb, bn, sl, n_pieces, nbw):
+    """Before slice task ``task``: the AG flags of the pieces its rows and columns touch."""
+    c0 = (task % mhc.SLICES) * mhc.COLS
+    tb = (task // mhc.SLICES) * br
+    last = (fx.min(tb + br, rows) - 1) // rb
+    band = fx.min(tb // rb + c["tid"], last)
+    idx = (c0 // sl) * n_pieces + band * (sl // bn) + (c0 % sl) // bn
+    _poll_peer(c, fx.min(nbw, last - tb // rb + 1), "agf_own", idx)
+
+
 _BUILDS: dict = {}
 
 
 def build(
     rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="route", trace=False,
-    shared_w=1.0, oneshot=False,
+    shared_w=1.0, oneshot=False, t1=False,
 ):
     keyed = key_tuple(locals(), SOURCES)
     key = (
         rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop, trace, shared_w,
-        oneshot,
+        oneshot, t1,
     )
     if key in _BUILDS:
         return _BUILDS[key]
@@ -134,8 +148,11 @@ def build(
     ntr, tmr = route.n_tiles(gr), -(-rows // gr.bm)
     n_router = ntr * gr.ks * tmr
     br = rows // mhc.bands(rows)
+    nbw = (br - 1) // rb_o + 2  # AG bands a slice band can touch
     sc = scratch_layout(rows, tt, trace)
-    poffs, half = coll.layout(rows, rb_o, go.bn, tp, oneshot)
+    poffs, half = coll.layout(rows, rb_o, go.bn, tp, oneshot, t1)
+    n_tpush = -(-rows // rb_o) * (HIDDEN // go.bn) if t1 else 0
+    n_treduce = n_pieces if t1 else 0
     lw = mhc.lds_words(rows)
     proj_words = rows * kda.NPROJ // 2
     zero_per = -(-proj_words // (n_seam * 4)) * 4
@@ -172,7 +189,7 @@ def build(
 
     @flyc.kernel(
         name=f"g53w_layer_r{rows}_t{tt}_tp{tp}_s{int(state_bf16)}_iw{int(has_iw)}_{stop}"
-        f"_tr{int(trace)}_os{int(oneshot)}",
+        f"_tr{int(trace)}_os{int(oneshot)}_t1{int(t1)}",
         known_block_size=[THREADS, 1, 1],
     )
     def kernel(
@@ -186,6 +203,7 @@ def build(
         hc_fn_f: I64, hc_scale_f: I64, hc_base_f: I64, norm_w_f: I64, res_mid: I64,
         x_f: I64, post_f: I64, comb_f: I64,
         w_r: I64, bias_r: I64, ids: I64, wts: I64, logits: I64,
+        moe_in: I64, post_p: I64, comb_p: I64, res_cur: I64,
         epoch: I64, scratch: I64, peers: I64, rank: I32,
         cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32, iw_win: I32,
         rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32, ring_len: I32,
@@ -232,25 +250,54 @@ def build(
 
             return store
 
+        base = 0
+        if const_expr(t1):
+            ct = coll.prefixed(
+                kcoll.region_context(peers, rank, epoch, 0, poffs, half, tid, bid), "t_"
+            )
+            # ---- tpush: the MoE partial's (band, column tile) pieces to their owners
+            for task in range(first_task(bid, base), n_tpush, BLOCKS):
+                band = task // (HIDDEN // go.bn)
+                n0 = (task % (HIDDEN // go.bn)) * go.bn
+                _push_band_flag(
+                    ct, moe_in, rows, HIDDEN, band * rb_o, rb_o, n0, go.bn, 1, "linbf", sl,
+                    band * ct_o + (n0 % sl) // go.bn,
+                )
+            base += n_tpush
+            # ---- treduce
+            for piece in range(first_task(bid, base), n_treduce, BLOCKS):
+                coll.reduce_bcast(ct, piece, rows, rb_o, go.bn, tp)
+            base += n_treduce
+            r_attn = res_cur
+            a_in = dict(res_in=res_in, x_in=ct["ag_own"].value, post_in=post_p,
+                        comb_in=comb_p, res_out=res_cur)
+            a_kw = dict(x_cm=CM_SYS)
+        else:
+            r_attn = res_in
+            a_in = dict(res_in=res_in)
+            a_kw = {}
         # ---- aseam: zero this task's share of proj, then the attention mHC slice
         mca = seam_ctx(
             "pmix_a",
-            dict(res_in=res_in, hc_fn=hc_fn_a, hc_scale=hc_scale_a, hc_base=hc_base_a,
-                 norm_w=norm_w_a, post_out=post_a, comb_out=comb_a),
+            dict(hc_fn=hc_fn_a, hc_scale=hc_scale_a, hc_base=hc_base_a,
+                 norm_w=norm_w_a, post_out=post_a, comb_out=comb_a, **a_in),
             x_store(x_a),
             lambda t: _flag(tid, scratch, sc["xflag"] + t, ep + 1),
+            **a_kw,
         )
         r_proj = rsrc(proj, proj_words * 4)
         zero4 = fx.Vector.filled(4, 0, fx.Int32)
-        for task in range(first_task(bid, 0), n_seam, BLOCKS):
+        for task in range(first_task(bid, base), n_seam, BLOCKS):
             for z0 in range(0, zero_per, THREADS * 4):
                 wi = task * zero_per + z0 + tid * 4
                 bo.buffer_store(zero4, r_proj, wi, mask=wi < proj_words, cache_modifier=CM_DEV)
             rocdl.s_waitcnt(vmcnt=0)
+            if const_expr(t1):
+                _poll_ag(ct, task, rows, br, rb_o, go.bn, sl, n_pieces, nbw)
             mhc.slice_task(mca, task)
         stamp(1)
         # ---- agate
-        base = n_seam
+        base += n_seam
         for t in range(first_task(bid, base), rows, BLOCKS):
             mhc.gate_row(mca, t)
         stamp(2)
@@ -348,26 +395,23 @@ def build(
                 o_args = dict(x_in=co["ag_own"].value)
             mcf = seam_ctx(
                 "pmix_f",
-                dict(res_in=res_in, post_in=post_a, comb_in=comb_a,
+                dict(res_in=r_attn, post_in=post_a, comb_in=comb_a,
                      res_out=res_mid, hc_fn=hc_fn_f, hc_scale=hc_scale_f, hc_base=hc_base_f,
                      norm_w=norm_w_f, post_out=post_f, comb_out=comb_f, **o_args),
                 x_store(x_f),
                 lambda t: _flag(tid, scratch, sc["xfflag"] + t, ep + 1),
                 x_cm=CM_SYS,
             )
-            nbw = (br - 1) // rb_o + 2  # AG bands a slice band can touch
             for task in range(first_task(bid, base), n_seam, BLOCKS):
-                c0 = (task % mhc.SLICES) * mhc.COLS
-                tb = (task // mhc.SLICES) * br
-                last = (fx.min(tb + br, rows) - 1) // rb_o
                 if const_expr(oneshot):
+                    c0 = (task % mhc.SLICES) * mhc.COLS
+                    tb = (task // mhc.SLICES) * br
+                    last = (fx.min(tb + br, rows) - 1) // rb_o
                     band = fx.min(tb // rb_o + tid % nbw, last)
                     idx = (tid // nbw) * pf + band * (HIDDEN // go.bn) + c0 // go.bn
                     _poll_peer(co, tp * nbw, "osf_own", idx)
                 else:
-                    band = fx.min(tb // rb_o + tid, last)
-                    idx = (c0 // sl) * n_pieces + band * ct_o + (c0 % sl) // go.bn
-                    _poll_peer(co, fx.min(nbw, last - tb // rb_o + 1), "agf_own", idx)
+                    _poll_ag(co, task, rows, br, rb_o, go.bn, sl, n_pieces, nbw)
                 mhc.slice_task(mcf, task)
             stamp(7)
             # ---- fgate
@@ -424,6 +468,7 @@ def build(
         hc_fn_f: I64, hc_scale_f: I64, hc_base_f: I64, norm_w_f: I64, res_mid: I64,
         x_f: I64, post_f: I64, comb_f: I64,
         w_r: I64, bias_r: I64, ids: I64, wts: I64, logits: I64,
+        moe_in: I64, post_p: I64, comb_p: I64, res_cur: I64,
         epoch: I64, scratch: I64, peers: I64, rank: I32,
         cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32, iw_win: I32,
         rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32, ring_len: I32,
@@ -434,7 +479,8 @@ def build(
             res_in, hc_fn_a, hc_scale_a, hc_base_a, norm_w_a, x_a, post_a, comb_a, w_in, proj,
             conv_w, conv_st, cs_idx, iw, iw_idx, w_fgb, a_log, dt_bias, state, h0_idx, rawv,
             rawk, ring_g, ring_beta, ring_idx, on_w, core, w_o, acc_o, hc_fn_f, hc_scale_f,
-            hc_base_f, norm_w_f, res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, logits, epoch,
+            hc_base_f, norm_w_f, res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, logits,
+            moe_in, post_p, comb_p, res_cur, epoch,
             scratch, peers, rank,
             cs_line, cs_tok, iw_line, iw_step, iw_win, rawv_slot, rawk_slot, g_slot,
             beta_slot, ring_len,
@@ -445,7 +491,8 @@ def build(
         n_kda=reqs * kda.NH, n_oproj=n_oproj, n_pieces=n_pieces, rgate=gr,
         n_router=n_router, scratch_words=sc["end"],
         epoch_words=EPOCH_MARKS + BLOCKS,
-        peer_bytes=coll.peer_bytes(rows, rb_o, go.bn, tp, oneshot), oneshot=oneshot,
+        peer_bytes=coll.peer_bytes(rows, rb_o, go.bn, tp, oneshot, t1), oneshot=oneshot,
+        t1=t1, n_tpush=n_tpush,
     )
     _BUILDS[key] = launch
     return launch
