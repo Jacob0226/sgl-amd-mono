@@ -239,6 +239,51 @@ def perf_check(key, r, needs_gain):
     )
 
 
+# pytest's exit codes whose junit XML holds every test: all passed (0) or some
+# failed (1). A file that does not import stops the run before any test (2), and
+# "no tests collected" is 5: matching those against the base proves nothing.
+COMPARABLE_RC = (0, 1)
+
+
+def compare_base(r, name, c):
+    """Hold the PR's failing ``name`` tests against the base branch's.
+
+    Returns ``(new, why)``: ``new`` lists the PR's failures the base branch does
+    not have, or has failing another way (another message: the same failure on
+    both prints the same exception and text, masked of paths and addresses by
+    run_model.py, so a PR that makes a failing test fail differently, such as a
+    new hash in a drift test or a worse value, is held to it). When the two
+    cannot be compared, ``new`` is None and ``why`` says why (None when the run
+    has no base tests at all: the nightly, or tests the base side does not run).
+    """
+    b = r.get("base_tests", {}).get(name)
+    if b is None:
+        return None, None
+    if b.get("error"):
+        return None, b["error"]
+    for side, x in (("this PR", c), ("the base branch", b)):
+        if x.get("rc") not in COMPARABLE_RC:
+            return None, f"pytest exited {x.get('rc')} on {side}"
+        if len(x.get("failed_ids", [])) != x["failed"]:
+            return None, f"no per-test results on {side}"
+    pr, base = _msgs(c), _msgs(b)
+    return sorted(i for i in pr if pr[i] is None or pr[i] != base.get(i)), None
+
+
+def _msgs(c):
+    msgs = c.get("failed_msgs", {})
+    return {i: msgs.get(i) for i in c["failed_ids"]}
+
+
+def _names(ids, n=3):
+    # "test.unit.test_contract::test_x[...]" -> "test_contract::test_x[...]"
+    short = [
+        f"`{cls.rsplit('.', 1)[-1]}::{test}`"
+        for cls, _, test in (i.partition("::") for i in ids[:n])
+    ]
+    return ", ".join(short) + (f" and {len(ids) - n} more" if len(ids) > n else "")
+
+
 def tests_check(key, r):
     m = MODELS.get(key, {})
     t = r.get("tests", {})
@@ -254,12 +299,27 @@ def tests_check(key, r):
             states.append(FAIL)
             parts.append(f"{name}: did not run")
             continue
-        states.append(FAIL if c["failed"] else PASS)
         s = f"{name} {c['passed']} passed"
-        if c["failed"]:
+        new, why = compare_base(r, name, c) if c["failed"] else (None, None)
+        if new == []:
+            # every failure also fails on the base branch, with the same message: the
+            # PR's tests pass
+            states.append(WARN)
+            s += (
+                f", {c['failed']} failed, all also on the base branch"
+                f" (not this PR's): {_names(c['failed_ids'])}"
+            )
+        elif c["failed"]:
+            states.append(FAIL)
             s += f", **{c['failed']} failed**" + (
                 " (timed out)" if c.get("timeout") else ""
             )
+            if new is not None:
+                s += f" ({len(new)} new: {_names(new)})"
+            elif why:
+                s += f" (not compared with the base branch: {why})"
+        else:
+            states.append(PASS)
         if c["skipped"]:
             s += f", {c['skipped']} skipped"
         parts.append(s)

@@ -1,6 +1,6 @@
 """The Qwen3.8 MoE gfx950 monokernel spec on CPU (RFC #43949): its registry entry
 and widths, and its config and model refusal reasons. The fused shared expert and
-the MXFP4 GDN projections refuse at startup, once a model."""
+the MXFP4 GDN projections run."""
 
 import sys
 from types import SimpleNamespace
@@ -56,14 +56,33 @@ def _cfg(**kw):
     )
 
 
-def test_config_reasons():
+MTP = {
+    "speculative_algorithm": "NEXTN",
+    "speculative_eagle_topk": 1,
+    "speculative_num_steps": 3,
+    "speculative_num_draft_tokens": 4,
+}
+
+
+def test_config_reasons(monkeypatch):
+    import sglang.srt.configs.mamba_utils as mamba_utils
+
+    monkeypatch.setattr(
+        mamba_utils,
+        "mamba2_state_dtype",
+        lambda config: SimpleNamespace(temporal=torch.bfloat16, conv=torch.bfloat16),
+    )
     reasons = qwen.SPEC.config_disable_reasons
     assert reasons(_cfg(), QWEN) == []
-    assert reasons(_cfg(enable_linear_replayssm=True), QWEN) == []
-    assert reasons(_cfg(enforce_shared_experts_fusion=True), QWEN) == [qwen.PENDING_FSE]
+    assert reasons(_cfg(**MTP, enable_linear_replayssm=True), QWEN) == []
+    assert reasons(_cfg(enforce_shared_experts_fusion=True), QWEN) == []
     other = SimpleNamespace(**{**vars(QWEN), "hidden_size": 4096})
-    joined = " | ".join(reasons(_cfg(), other))
-    assert "hidden_size = 8192" in joined, joined
+    joined = " | ".join(
+        reasons(_cfg(**{**MTP, "speculative_eagle_topk": 4}), other)
+        + reasons(_cfg(enable_linear_replayssm=True), QWEN)
+    )
+    for want in ("hidden_size = 8192", "one draft chain", "--enable-linear-replayssm"):
+        assert want in joined, joined
 
 
 def _meta(*shape, dtype=torch.bfloat16):
@@ -106,15 +125,21 @@ def _layer(i, gdn=True, fse=False, mxfp4=False, eps=1e-6):
     if not gdn:
         layer.o_proj, layer.attn_output_gate, layer.q_size = _w(8192, 2048), True, 2048
         return layer
-    out = _w(8192, 2048)
+    out, qkvz = _w(8192, 2048), _w(4608, 8192)
     if mxfp4:
         out = SimpleNamespace(
             weight=_meta(8192, 1024, dtype=torch.uint8),
             weight_scale=_meta(8192, 64, dtype=torch.uint8),
+            quant_method=SimpleNamespace(),
+        )
+        qkvz = SimpleNamespace(
+            weight=_meta(4608, 4096, dtype=torch.uint8),
+            weight_scale=_meta(4608, 256, dtype=torch.uint8),
+            quant_method=SimpleNamespace(),
         )
     layer.linear_attn = SimpleNamespace(
         layer_id=i,
-        in_proj_qkvz=_w(4608, 8192),
+        in_proj_qkvz=qkvz,
         in_proj_ba=_w(32, 8192),
         conv1d=SimpleNamespace(weight=_meta(2560, 1, 4), bias=None),
         A_log=_meta(16, dtype=torch.float32),
@@ -139,32 +164,63 @@ def _model(layers):
     return SimpleNamespace(model=body)
 
 
-@pytest.mark.parametrize("kw", [{}, {"fse": True}, {"mxfp4": True}])
+@pytest.mark.parametrize(
+    "kw", [{}, {"fse": True}, {"mxfp4": True}, {"fse": True, "mxfp4": True}]
+)
 def test_model_reasons(kw):
     # Qwen3.8's pattern: three GDN layers, then a full-attention layer
     layers = [_layer(i, gdn=i % 4 != 3, **kw) for i in range(8)]
     reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
-    want = {
-        "fse": [qwen.PENDING_FSE],
-        "mxfp4": [qwen.PENDING_MXFP4],
-    }
-    # each pending variant refuses once, not once a layer
-    assert reasons == want.get(next(iter(kw), None), []), reasons
+    assert reasons == [], reasons
+
+
+@pytest.mark.parametrize("proj", ["in_proj_qkvz", "out_proj"])
+@pytest.mark.parametrize(
+    "state, refused",
+    [
+        ({}, False),
+        ({"hadamard": False, "quant_kwargs": {}}, False),
+        ({"hadamard": True, "quant_kwargs": {"hadamard_rotate": True}}, True),
+        ({"quant_kwargs": {"hadamard_rotate": True}}, True),
+    ],
+)
+def test_mxfp4_gdn_projections_have_no_rotation(proj, state, refused):
+    # sgl-project/sglang#46059 rotates the weight and the activation; K1 and K2 do not
+    layers = [_layer(i, gdn=i % 4 != 3, mxfp4=True) for i in range(8)]
+    getattr(layers[1].linear_attn, proj).quant_method = SimpleNamespace(**state)
+    reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
+    if refused:
+        assert len(reasons) == 1 and reasons[0].startswith("layer 1:"), reasons
+        assert "SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0" in reasons[0], reasons
+    else:
+        assert reasons == [], reasons
+
+
+def test_the_shared_expert_is_unfused_or_expert_512():
+    layers = [_layer(i, gdn=i % 4 != 3, fse=True) for i in range(8)]
+    layers[1].mlp = _mlp()
+    layers[1].mlp.shared_expert = None
+    layers[2].mlp = _mlp()
+    layers[2].mlp.shared_expert, layers[2].mlp.num_fused_shared_experts = None, 1
+    reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
+    assert reasons[0] == "layer 1: needs the shared expert", reasons
+    assert reasons[1].startswith("layer 2: routed w13 shape (512,"), reasons
+    assert len(reasons) == 2, reasons
 
 
 def test_check_compares_the_rows_routed_alike():
     from sgl_amd_mono.qwen38_a95b_mxfp4 import check
 
     k2 = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
-    # SGLang's order differs
-    ids = torch.tensor([[3, 1, 2], [4, 5, 7]], dtype=torch.int32)
+    # SGLang's order differs, and FSE puts the shared slot after the top-k
+    ids = torch.tensor([[3, 1, 2, 512], [4, 5, 7, 512]], dtype=torch.int32)
     assert check.routed_alike(ids, k2).tolist() == [True, False]
 
 
 def test_model_reasons_name_the_layer():
     layers = [_layer(i, gdn=i % 4 != 3) for i in range(8)]
-    layers[1].post_attention_layernorm = _norm(1e-5)
-    layers[2].linear_attn.out_proj = _w(8192, 2048, dtype=torch.float8_e4m3fn)
+    layers[1] = _layer(1, eps=1e-5)
+    layers[2].linear_attn.A_log = _meta(16)
     layers[3].mlp.experts.w13_weight.is_shuffled = False
     layers[7].o_proj = _w(8192, 2048, dtype=torch.float8_e4m3fn)
     reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
@@ -174,8 +230,8 @@ def test_model_reasons_name_the_layer():
         "layer 3",
         "layer 7",
     ]
-    assert "eps" in reasons[0] and "out_proj in bf16" in reasons[1]
-    assert "shuffled" in reasons[2] and "o_proj in bf16" in reasons[3]
+    assert "eps" in reasons[0] and "A_log" in reasons[1] and "shuffled" in reasons[2]
+    assert "o_proj in bf16" in reasons[3]
 
 
 def test_aux_hidden_states_run_sglangs_forward():

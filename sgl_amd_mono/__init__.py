@@ -36,6 +36,10 @@ SPECS = {
     ("Qwen3_5MoeForCausalLM", None): "sgl_amd_mono.qwen38_a95b_mxfp4.spec:SPEC",
     ("KimiK3ForConditionalGeneration", None): "sgl_amd_mono.kimi_k3.spec:SPEC",
     ("KimiK31ForConditionalGeneration", None): "sgl_amd_mono.kimi_k31.spec:SPEC",
+    (
+        "Qwen3_5MoeForConditionalGeneration",
+        None,
+    ): "sgl_amd_mono.qwen35_a17b.spec:SPEC",
     # the MTP draft routes its own steps (qwen38_flash_next/draft.py)
     ("Qwen4ExpForCausalLMMTP", None): "sgl_amd_mono.qwen38_flash_next.draft:SPEC",
     (
