@@ -5,8 +5,8 @@ the fused shared expert).
     router  split-K tiles of logits = x_f @ W_r^T, each K slice's f32 partials stored
             to its own [rows, N_EXPERTS] plane (no atomics: every rank must route alike)
     route   a row: the slices summed in a fixed order, sigmoid scores, top-8 of score +
-            bf16 bias (AITER's tie order), weights score / sum * ROUTE_SCALE; slot
-            TOP_K is the shared expert
+            the f32 bias rounded to bf16 (AITER's tie order), weights score / sum *
+            ROUTE_SCALE; slot TOP_K is the shared expert
 
 The logits stay f32 (SGLang's split-K decode router above 16 rows; the narrow kernel's
 small-M router rounds them to bf16).
@@ -149,9 +149,12 @@ def route_row(tid, t, rows, ks, parts, bias, ids_out, w_out, logits, red, shared
     gpu.barrier()
     if wave == 0:
         r_b = rsrc(bias)
+        # the f32 bias as SGLang's grouped top-k holds it: rounded to bf16
         bs = [
             fx.Float32(
-                fx.BFloat16(bo.buffer_load(r_b, cand[i], vec_width=1, dtype=T.bf16))
+                fx.Float32(bo.buffer_load(r_b, cand[i], vec_width=1, dtype=T.f32)).to(
+                    fx.BFloat16
+                )
             )
             for i in range(CAND)
         ]

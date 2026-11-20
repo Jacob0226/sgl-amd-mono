@@ -76,7 +76,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             norm=(1 + rnd(HIDDEN, scale=0.1)).to(torch.bfloat16),
         ))
     w_r = rnd(N_EXPERTS, HIDDEN, scale=0.02, dt=torch.bfloat16)
-    bias_r = rnd(N_EXPERTS, scale=0.5, dt=torch.bfloat16)
+    bias_r = rnd(N_EXPERTS, scale=0.5)
     # this rank's heads
     lg = torch.Generator(device=dev).manual_seed(100 + rank)
     w_in = rnd(NPROJ, HIDDEN, scale=0.02, dt=torch.bfloat16, g=lg)
@@ -244,7 +244,7 @@ def route_check(x_f, w_r, bias_r, ids, wts):
     """Picked sets against torch (a row whose 8th and 9th keys are within 1e-5 is
     excused), the weights in id order, the shared slot."""
     s = torch.sigmoid(x_f.float() @ w_r.float().T)
-    keys = s + bias_r.float()
+    keys = s + bias_r.to(torch.bfloat16).float()
     kv, ki = keys.topk(TOP_K + 1, dim=1)
     ref_ids = ki[:, :TOP_K]
     tie = (kv[:, TOP_K - 1] - kv[:, TOP_K]) < 1e-5

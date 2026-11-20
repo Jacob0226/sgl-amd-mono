@@ -55,7 +55,7 @@ def run(a, reqs, rank, tp, dev, cpu):
                base=rnd(24, scale=0.3), norm=(1 + rnd(HIDDEN, scale=0.1)).to(torch.bfloat16))
           for _ in range(2)]
     w_r = rnd(N_EXPERTS, HIDDEN, scale=0.02, dt=torch.bfloat16)
-    bias_r = rnd(N_EXPERTS, scale=0.5, dt=torch.bfloat16)
+    bias_r = rnd(N_EXPERTS, scale=0.5)
     w_in = rnd(NPROJ, HIDDEN, scale=0.02, dt=torch.bfloat16, g=lg)
     w_o = rnd(HIDDEN, P, scale=0.02, dt=torch.bfloat16, g=lg)
     w_m = rnd(HIDDEN, HIDDEN, scale=0.01, dt=torch.bfloat16, g=lg)
@@ -122,7 +122,7 @@ def run(a, reqs, rank, tp, dev, cpu):
         return {k: last[k].clone() for k in ("res_mid", "x_f", "ids", "wts", "post_f", "comb_f")}
 
     def key_set_bad(ids_a, ids_b, logits, bias):
-        keys = torch.sigmoid(logits) + bias.float()
+        keys = torch.sigmoid(logits) + bias.to(torch.bfloat16).float()
         kv = keys.topk(TOP_K + 1, dim=1).values
         tie = (kv[:, TOP_K - 1] - kv[:, TOP_K]) < 2e-2
         same = (ids_a[:, :TOP_K].sort(1).values == ids_b[:, :TOP_K].sort(1).values).all(1)
