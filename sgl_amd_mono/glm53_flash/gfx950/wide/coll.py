@@ -9,6 +9,11 @@ Shot 2 (AG): the owner sums a piece's tp sources in rank order (f32, then bf16, 
 the custom all-reduce does) and stores the sum into every rank's ``ag`` region
 [rows][HIDDEN], then flags (owner, piece) in every rank's ``agf``. Every rank thus
 holds the same bits.
+
+One-shot (``oneshot``): the epilogue pushes the band into every rank's ``os`` region
+[src][rows][HIDDEN] and flags (src, piece) in every rank's ``osf``; the reader sums
+the tp sources in rank order itself (the same bits as shot 2's). One hop fewer, tp
+times shot 1's bytes on every link.
 """
 
 import flydsl.compiler as flyc
@@ -18,7 +23,7 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.ops import CM_SYS, bf2_f32, bf16_pair, rsrc, uniform
+from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf2_f32, bf16_pair, rsrc, uniform
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES
 from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN
 
@@ -28,20 +33,32 @@ def pieces(rows, rb, bn, tp):
     return -(-rows // rb) * ((HIDDEN // tp) // bn)
 
 
-def layout(rows, rb, bn, tp):
+def full_pieces(rows, rb, bn):
+    """A source's one-shot pieces: row bands of rb x column tiles of bn over HIDDEN."""
+    return -(-rows // rb) * (HIDDEN // bn)
+
+
+def layout(rows, rb, bn, tp, oneshot=False):
     """Byte offsets of one parity half and the half's size."""
-    sl = HIDDEN // tp
-    rs = tp * rows * sl * 2
-    ag = rows * HIDDEN * 2
-    fl = tp * BLOCKS * 8
-    agf = tp * pieces(rows, rb, bn, tp) * 8
-    offs = {"rs": 0, "ag": rs, "fl": rs + ag, "agf": rs + ag + fl}
-    half = (rs + ag + fl + agf + 255) // 256 * 256
-    return offs, half
+    sizes = {}
+    if oneshot:
+        sizes["os"] = tp * rows * HIDDEN * 2
+        sizes["osf"] = tp * full_pieces(rows, rb, bn) * 8
+    else:
+        sl = HIDDEN // tp
+        sizes["rs"] = tp * rows * sl * 2
+        sizes["ag"] = rows * HIDDEN * 2
+        sizes["fl"] = tp * BLOCKS * 8
+        sizes["agf"] = tp * pieces(rows, rb, bn, tp) * 8
+    offs, w = {}, 0
+    for k, v in sizes.items():
+        offs[k] = w
+        w += v
+    return offs, (w + 255) // 256 * 256
 
 
-def peer_bytes(rows, rb, bn, tp):
-    return 2 * layout(rows, rb, bn, tp)[1] + guard.FLAG_BYTES
+def peer_bytes(rows, rb, bn, tp, oneshot=False):
+    return 2 * layout(rows, rb, bn, tp, oneshot)[1] + guard.FLAG_BYTES
 
 
 @flyc.jit
@@ -100,3 +117,41 @@ def reduce_bcast(c, piece, m, rb, bn, tp):
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     put_each(c, tp, "agf", own * pieces(m, rb, bn, tp) + piece, fx.Int32(1))
+
+
+@flyc.jit
+def push_all(c, acc, m, row0, rb, n0, bn, tp, piece):
+    """One-shot: rows row0 .. row0 + rb, columns n0 .. n0 + bn of this rank's finished
+    bf16 partial ``acc`` [m, HIDDEN] into every rank's ``os`` [rank][m][HIDDEN] (``acc``
+    zeroed behind), drained, then flag (rank, piece) in every rank's ``osf``."""
+    tid = c["tid"]
+    q8 = bn // 8
+    r = rsrc(acc)
+    dsts = [rsrc(c["os_of"](p).value) for p in range(tp)]
+    got = []
+    for i in range_constexpr((rb * q8 + THREADS - 1) // THREADS):
+        u = fx.min(tid + i * THREADS, rb * q8 - 1)
+        row = row0 + u // q8
+        col = n0 + 8 * (u % q8)
+        w = fx.Vector(
+            bo.buffer_load(
+                r, (fx.min(row, m - 1) * HIDDEN + col) // 2, vec_width=4, dtype=T.i32,
+                cache_modifier=CM_DEV,
+            )
+        )
+        got.append((row, col, w, tid + i * THREADS < rb * q8))
+    for row, col, w, live in got:
+        if (row < m) & live:
+            for p in range_constexpr(tp):
+                bo.buffer_store(
+                    w, dsts[p], ((c["rank"] * m + row) * HIDDEN + col) // 2,
+                    cache_modifier=CM_SYS,
+                )
+            bo.buffer_store(
+                fx.Vector.filled(4, 0, fx.Int32), r, (row * HIDDEN + col) // 2,
+                cache_modifier=CM_DEV,
+            )
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if row0 < m:
+        put_each(c, tp, "osf", c["rank"] * full_pieces(m, rb, bn) + piece, fx.Int32(1))

@@ -8,7 +8,8 @@ CTAs, one task loop a stage, no grid barrier) a KDA layer on each of ``tp`` rank
     kda     (request, head): f_b / g_b, conv, ring verify, gated RMSNorm -> core
     oproj   this rank's partial core @ W_o^T, K slices merged in a local tile, each
             slice's band of rows pushed to the column owner (RS)
-    reduce  the owner sums its pieces in rank order and stores them on every rank (AG)
+    reduce  the owner sums its pieces in rank order and stores them on every rank (AG);
+            with ``oneshot`` none: oproj pushes to every rank, fseam sums the sources
     fseam   FFN mHC slices: R_mid = post o + comb R (hc_post) and their mixes
     fgate   a row's FFN mixes -> post_f / comb_f, the FFN input x_f
     router  split-K f32 partials of x_f @ W_r^T (``route``)
@@ -102,10 +103,13 @@ _BUILDS: dict = {}
 
 def build(
     rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="route", trace=False,
-    shared_w=1.0,
+    shared_w=1.0, oneshot=False,
 ):
     keyed = key_tuple(locals(), SOURCES)
-    key = (rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop, trace, shared_w)
+    key = (
+        rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop, trace, shared_w,
+        oneshot,
+    )
     if key in _BUILDS:
         return _BUILDS[key]
     assert rows % tt == 0 and stop in STOPS
@@ -122,13 +126,15 @@ def build(
     sl = HIDDEN // tp
     ct_o = sl // go.bn
     n_pieces = coll.pieces(rows, rb_o, go.bn, tp)
+    n_reduce = 0 if oneshot else n_pieces
+    pf = coll.full_pieces(rows, rb_o, go.bn)
     n_seam = mhc.tasks(rows)
     gr = route.rgate_cfg(rows)
     ntr, tmr = route.n_tiles(gr), -(-rows // gr.bm)
     n_router = ntr * gr.ks * tmr
     br = rows // mhc.bands(rows)
     sc = scratch_layout(rows, tt, trace)
-    poffs, half = coll.layout(rows, rb_o, go.bn, tp)
+    poffs, half = coll.layout(rows, rb_o, go.bn, tp, oneshot)
     lw = mhc.lds_words(rows)
     proj_words = rows * kda.NPROJ // 2
     zero_per = -(-proj_words // (n_seam * 4)) * 4
@@ -165,7 +171,7 @@ def build(
 
     @flyc.kernel(
         name=f"g53w_layer_r{rows}_t{tt}_tp{tp}_s{int(state_bf16)}_iw{int(has_iw)}_{stop}"
-        f"_tr{int(trace)}",
+        f"_tr{int(trace)}_os{int(oneshot)}",
         known_block_size=[THREADS, 1, 1],
     )
     def kernel(
@@ -314,25 +320,36 @@ def build(
                     ),
                 )
                 _arrive_all(tid, cnt_o, tile, go.ks, kl, CNT_STRIDE)
-                piece = ((m0 + sk * rb_o) // rb_o) * ct_o + (n0 % sl) // go.bn
-                _push_band_flag(
-                    co, acc_o, rows, HIDDEN, m0 + sk * rb_o, rb_o, n0, go.bn, go.ks,
-                    "linbf", sl, piece,
-                )
+                ob = (m0 + sk * rb_o) // rb_o
+                if const_expr(oneshot):
+                    coll.push_all(
+                        co, acc_o, rows, m0 + sk * rb_o, rb_o, n0, go.bn, tp,
+                        ob * (HIDDEN // go.bn) + n0 // go.bn,
+                    )
+                else:
+                    _push_band_flag(
+                        co, acc_o, rows, HIDDEN, m0 + sk * rb_o, rb_o, n0, go.bn, go.ks,
+                        "linbf", sl, ob * ct_o + (n0 % sl) // go.bn,
+                    )
             stamp(5)
             # ---- reduce + broadcast: this rank's column slice
             base += n_oproj
-            for piece in range(first_task(bid, base), n_pieces, BLOCKS):
-                coll.reduce_bcast(co, piece, rows, rb_o, go.bn, tp)
+            if const_expr(not oneshot):
+                for piece in range(first_task(bid, base), n_reduce, BLOCKS):
+                    coll.reduce_bcast(co, piece, rows, rb_o, go.bn, tp)
             stamp(6)
         if const_expr(level >= 2):
             # ---- fseam: R_mid = post o + comb R, the FFN mixes
-            base += n_pieces
+            base += n_reduce
+            if const_expr(oneshot):
+                o_args = dict(x_in=co["os_own"].value, x_parts=(tp, rows * HIDDEN))
+            else:
+                o_args = dict(x_in=co["ag_own"].value)
             mcf = seam_ctx(
                 "pmix_f",
-                dict(res_in=res_in, x_in=co["ag_own"].value, post_in=post_a, comb_in=comb_a,
+                dict(res_in=res_in, post_in=post_a, comb_in=comb_a,
                      res_out=res_mid, hc_fn=hc_fn_f, hc_scale=hc_scale_f, hc_base=hc_base_f,
-                     norm_w=norm_w_f, post_out=post_f, comb_out=comb_f),
+                     norm_w=norm_w_f, post_out=post_f, comb_out=comb_f, **o_args),
                 x_store(x_f),
                 lambda t: _flag(tid, scratch, sc["xfflag"] + t, ep + 1),
                 x_cm=CM_SYS,
@@ -341,9 +358,15 @@ def build(
             for task in range(first_task(bid, base), n_seam, BLOCKS):
                 c0 = (task % mhc.SLICES) * mhc.COLS
                 tb = (task // mhc.SLICES) * br
-                band = fx.min(tb // rb_o + tid, (rows - 1) // rb_o)
-                idx = (c0 // sl) * n_pieces + band * ct_o + (c0 % sl) // go.bn
-                _poll_peer(co, fx.min(nbw, (tb + br - 1) // rb_o - tb // rb_o + 1), "agf_own", idx)
+                last = (fx.min(tb + br, rows) - 1) // rb_o
+                if const_expr(oneshot):
+                    band = fx.min(tb // rb_o + tid % nbw, last)
+                    idx = (tid // nbw) * pf + band * (HIDDEN // go.bn) + c0 // go.bn
+                    _poll_peer(co, tp * nbw, "osf_own", idx)
+                else:
+                    band = fx.min(tb // rb_o + tid, last)
+                    idx = (c0 // sl) * n_pieces + band * ct_o + (c0 % sl) // go.bn
+                    _poll_peer(co, fx.min(nbw, last - tb // rb_o + 1), "agf_own", idx)
                 mhc.slice_task(mcf, task)
             stamp(7)
             # ---- fgate
@@ -380,6 +403,7 @@ def build(
                     tid, ntr, scratch, sc["cnt_r"] + ((t // gr.bm) * ntr + tid) * CNT_STRIDE,
                     (ep + 1) * gr.ks,
                 )
+                stamp(12)
                 route.route_row(tid, t, rows, gr.ks, parts, bias_r, ids, wts, cl, shared_w)
             stamp(11)
         epoch_end(cb, epoch, ep)
@@ -417,7 +441,8 @@ def build(
         rows=rows, gemm=g, oproj=go, rb_o=rb_o, n_seam=n_seam, n_inproj=n_inproj,
         n_kda=reqs * kda.NH, n_oproj=n_oproj, n_pieces=n_pieces, rgate=gr,
         n_router=n_router, scratch_words=sc["end"],
-        epoch_words=EPOCH_MARKS + BLOCKS, peer_bytes=coll.peer_bytes(rows, rb_o, go.bn, tp),
+        epoch_words=EPOCH_MARKS + BLOCKS,
+        peer_bytes=coll.peer_bytes(rows, rb_o, go.bn, tp, oneshot), oneshot=oneshot,
     )
     _BUILDS[key] = launch
     return launch

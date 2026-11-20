@@ -105,7 +105,10 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     res_mid = z(m, HC, HIDDEN, dt=torch.bfloat16)
     x_f, post_f, comb_f = z(m, HIDDEN, dt=torch.bfloat16), z(m, HC), z(m, HC * HC)
     ids, wts = z(m, MOE_SLOTS, dt=torch.int32), z(m, MOE_SLOTS)
-    launch = layer.build(m, tt, tp, LB, ONORM_EPS, bool(sbf), True, a.stop, trace=a.trace)
+    launch = layer.build(
+        m, tt, tp, LB, ONORM_EPS, bool(sbf), True, a.stop, trace=a.trace,
+        oneshot=m <= a.oneshot_rows,
+    )
     plan = launch.plan
     epoch = z(plan["epoch_words"], dt=torch.int32)
     scratch = z(plan["scratch_words"], dt=torch.int32)
@@ -139,10 +142,18 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     errs["core"] = rel(mine["core"], ref["core"])
     errs["proj"] = rel(proj, (x_a.float() @ w_in.float().T).to(torch.bfloat16))
     if a.stop != "kda":
-        offs, half = coll.layout(m, plan["rb_o"], plan["oproj"].bn, tp)
+        offs, half = coll.layout(m, plan["rb_o"], plan["oproj"].bn, tp, plan["oneshot"])
         par = (epoch[0].item() - 1) % 2
-        o = peers.bytes[par * half + offs["ag"] :][: m * HIDDEN * 2].view(torch.bfloat16).view(m, HIDDEN)
-        o = o.clone()
+        if plan["oneshot"]:
+            os_ = peers.bytes[par * half + offs["os"] :][: tp * m * HIDDEN * 2]
+            os_ = os_.view(torch.bfloat16).view(tp, m, HIDDEN).float()
+            o = os_[0]
+            for p_ in range(1, tp):
+                o = o + os_[p_]
+            o = o.to(torch.bfloat16)
+        else:
+            o = peers.bytes[par * half + offs["ag"] :][: m * HIDDEN * 2]
+            o = o.view(torch.bfloat16).view(m, HIDDEN).clone()
         cores, wos = gather(mine["core"]), gather(w_o)
         o_ref = sum(c.float() @ w.float().T for c, w in zip(cores, wos)).to(torch.bfloat16)
         errs["o"] = rel(o, o_ref)
@@ -170,7 +181,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
         go()
     torch.cuda.synchronize()
     errs["ep"] = epoch[0].item()
-    line = f"rank {rank} reqs {reqs:2d} rows {m:3d} state {'bf16' if sbf else 'f32 '} " + "  ".join(
+    line = f"rank {rank} reqs {reqs:2d} rows {m:3d} os {int(plan['oneshot'])} state {'bf16' if sbf else 'f32 '} " + "  ".join(
         f"{k} {v:.1e}" if isinstance(v, float) else f"{k} {v}" for k, v in errs.items()
     )
     if a.time:
@@ -192,8 +203,8 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             acc = tr if acc is None else acc + tr
         tr = acc / 20
         names = ["start", "aseam", "agate", "inproj", "kda", "oproj", "reduce", "fseam",
-                 "fgate", "epoch", "router", "route"]
-        for p_, nm in sorted(enumerate(names), key=lambda x: x[0] if x[0] != 9 else 99):
+                 "fgate", "epoch", "router", "route", "rwait"]
+        for p_, nm in sorted(enumerate(names), key=lambda x: {9: 99, 12: 10.5}.get(x[0], x[0])):
             col = tr[:, p_]
             col = col[(col > -1e5) & (col < 1e5)]
             if col.numel() and rank == 0:
@@ -231,6 +242,7 @@ def main():
     ap.add_argument("--stop", default="route", choices=layer.STOPS)
     ap.add_argument("--launches", type=int, default=10)
     ap.add_argument("--time", action="store_true")
+    ap.add_argument("--oneshot-rows", type=int, default=0)
     ap.add_argument("--trace", action="store_true")
     a = ap.parse_args()
     rank = int(os.environ["RANK"])
