@@ -45,6 +45,7 @@ RGATE = {
     32: Gemm(32, 64, 2, 4, 16, 64, 4),
     64: Gemm(64, 64, 2, 4, 16, 64, 4),
     128: Gemm(128, 64, 4, 2, 16, 64, 4),
+    192: Gemm(96, 64, 2, 4, 16, 64, 4),
 }
 CAND = ROUTER_CANDIDATES
 RED_WORDS = WAVES * CAND * 64
