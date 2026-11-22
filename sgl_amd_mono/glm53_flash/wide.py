@@ -25,7 +25,7 @@ NARROW = 16
 TP = 4
 SUPPORTED_L = (6,)
 # requests a bucket launch runs; a step of fewer pads up to the next bucket
-REQ_BUCKETS = (3, 4, 6, 8, 12, 16)
+REQ_BUCKETS = (3, 4, 6, 8, 12, 16, 24, 32)
 HC = HF_CONFIG["hc_mult"]
 HIDDEN = HF_CONFIG["hidden_size"]
 TOPK_SLOTS = HF_CONFIG["num_experts_per_tok"] + HF_CONFIG["n_shared_experts"]
@@ -306,25 +306,18 @@ class Wide:
 
     def _experts(self, ly, cur, rows):
         """SGLang's routed experts (the fused shared expert at slot 8) on the
-        launch's FFN input and (ids, weights): this rank's partial -> cur["moe"]."""
-        from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+        launch's FFN input and (ids, weights): this rank's partial -> cur["moe"], which
+        aiter writes directly (``aiter_moe_output``)."""
         from sglang.srt.layers.moe.topk import build_precomputed_topk_output
+        from sglang.srt.runtime_context import get_forward
 
         moe = ly.moe
         out = cur["moe"][:rows]
         topk = build_precomputed_topk_output(
             cur["wts"][:rows], cur["ids"][:rows], moe.topk.topk_config, ly.i
         )
-        ctx = (
-            moe_output_buffer_ctx(out)
-            if not moe.experts.moe_runner_config.inplace
-            else None
-        )
-        if ctx is None:
+        with get_forward().scoped(aiter_moe_output=out):
             y = moe.experts(cur["x_f"][:rows], topk)
-        else:
-            with ctx:
-                y = moe.experts(cur["x_f"][:rows], topk)
         if y.data_ptr() != out.data_ptr():
             out.copy_(y)
 
