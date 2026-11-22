@@ -20,7 +20,10 @@ CTAs, one task loop a stage, no grid barrier) a KDA layer on each of ``tp`` rank
     route   a row: logits [rows, 288] f32, sigmoid, top-8 + the shared slot -> ids /
             weights [rows, 9]
 
-``stop`` ends the launch after a stage (``STOPS``). Hand-offs inside a rank: tagged
+``stop`` ends the launch after a stage (``STOPS``). Without ``body`` (a DSA layer's
+seams) the launch runs [t1] aseam agate, then (``stop="route"``) router route [sort]
+on agate's x: before the attention, the previous MoE's exit and the attention input
+(``stop="agate"``); after it, the attention's exit and the FFN input with its route. Hand-offs inside a rank: tagged
 mailbox pairs (tag = epoch + 1) for the slice partials, flag words (:= epoch + 1) for
 x rows, KDA heads and x_f rows, monotonic counters on their own lines for the GEMM
 tiles; across ranks: Kimi's flag format in the parity halves of the peer buffer.
@@ -56,6 +59,7 @@ from sgl_amd_mono.kimi_k31.gfx950.stages.tile import atomic_lin
 SOURCES = kernel_sources(__name__)
 
 STOPS = ("kda", "reduce", "fgate", "route")
+SEAM_STOPS = ("agate", "route")
 
 # o_proj [rows, 2048] x [4096, 2048]^T, the fastest direct-to-LDS cfg a width (dma_bench)
 OPROJ = {
@@ -121,17 +125,18 @@ _BUILDS: dict = {}
 
 def build(
     rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="route", trace=False,
-    shared_w=1.0, oneshot=False, t1=False, moe_sort=False,
+    shared_w=1.0, oneshot=False, t1=False, moe_sort=False, body=True,
 ):
     keyed = key_tuple(locals(), SOURCES)
     key = (
         rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop, trace, shared_w,
-        oneshot, t1, moe_sort,
+        oneshot, t1, moe_sort, body,
     )
     if key in _BUILDS:
         return _BUILDS[key]
-    assert rows % tt == 0 and stop in STOPS
-    level = STOPS.index(stop)
+    assert rows % tt == 0 and stop in (STOPS if body else SEAM_STOPS)
+    level = STOPS.index(stop) if body else -1
+    do_route = stop == "route"
     reqs = rows // tt
     g = inproj_cfg(rows)
     tn, tm = -(-kda.NPROJ // g.bn), -(-rows // g.bm)
@@ -199,16 +204,16 @@ def build(
 
     sly = sort.layout(rows)
     # the CTA the sort task lands on: first past the route rows (stage bases are static)
+    body_tasks = n_inproj + reqs * kda.NH + n_oproj + n_reduce + n_seam + rows if body else 0
     sort_cta = (
-        n_seam + rows + n_inproj + reqs * kda.NH + n_oproj + n_reduce + n_seam + rows
-        + n_router + rows + (n_tpush + n_treduce)
+        n_seam + rows + body_tasks + n_router + rows + (n_tpush + n_treduce)
     ) % BLOCKS
 
     I64, I32 = fx.Int64, fx.Int32
 
     @flyc.kernel(
         name=f"g53w_layer_r{rows}_t{tt}_tp{tp}_s{int(state_bf16)}_iw{int(has_iw)}_{stop}"
-        f"_tr{int(trace)}_os{int(oneshot)}_t1{int(t1)}",
+        f"_tr{int(trace)}_os{int(oneshot)}_t1{int(t1)}_b{int(body)}",
         known_block_size=[THREADS, 1, 1],
     )
     def kernel(
@@ -282,9 +287,10 @@ def build(
             for task in range(first_task(bid, base), n_tpush, BLOCKS):
                 band = task // (HIDDEN // go.bn)
                 n0 = (task % (HIDDEN // go.bn)) * go.bn
+                # the partial may be the caller's of m_tok rows (a DSA layer's attention)
                 _push_band_flag(
                     ct, moe_in, rows, HIDDEN, band * rb_o, rb_o, n0, go.bn, 1, "linbf", sl,
-                    band * ct_o + (n0 % sl) // go.bn,
+                    band * ct_o + (n0 % sl) // go.bn, nbytes=fx.Int32(m_tok) * (HIDDEN * 2),
                 )
             base += n_tpush
             # ---- treduce
@@ -312,10 +318,11 @@ def build(
         r_proj = rsrc(proj, proj_words * 4)
         zero4 = fx.Vector.filled(4, 0, fx.Int32)
         for task in range(first_task(bid, base), n_seam, BLOCKS):
-            for z0 in range(0, zero_per, THREADS * 4):
-                wi = task * zero_per + z0 + tid * 4
-                bo.buffer_store(zero4, r_proj, wi, mask=wi < proj_words, cache_modifier=CM_DEV)
-            rocdl.s_waitcnt(vmcnt=0)
+            if const_expr(body):
+                for z0 in range(0, zero_per, THREADS * 4):
+                    wi = task * zero_per + z0 + tid * 4
+                    bo.buffer_store(zero4, r_proj, wi, mask=wi < proj_words, cache_modifier=CM_DEV)
+                rocdl.s_waitcnt(vmcnt=0)
             if const_expr(t1):
                 _poll_ag(ct, task, rows, br, rb_o, go.bn, sl, n_pieces, nbw)
             mhc.slice_task(mca, task)
@@ -327,48 +334,49 @@ def build(
         stamp(2)
         # ---- inproj
         base += rows
-        kt = HIDDEN // g.ks
-        cnt_p = scratch + fx.Int64(sc["cnt_p"] * 4)
-        for task in range(first_task(bid, base), n_inproj, BLOCKS):
-            n0 = (task % tn) * g.bn
-            sk = (task // tn) % g.ks
-            m0 = (task // (tn * g.ks)) * g.bm
-            tile_dma.dma_tile(
-                tid, x_a, HIDDEN, rows, m0, w_in, HIDDEN, kda.NPROJ, n0, sk * kt, kt,
-                g.bm, g.bn, g.wm, g.wn, ab, None, g.bk, g.stages,
-                atomic_lin(proj, kda.NPROJ, n0, rows, kda.NPROJ, True), cl, CM_DEV,
-                wait_x=lambda: _wait_words(
-                    tid, fx.min(g.bm, rows - m0), scratch, sc["xflag"] + m0 + tid, ep + 1
+        if const_expr(body):
+            kt = HIDDEN // g.ks
+            cnt_p = scratch + fx.Int64(sc["cnt_p"] * 4)
+            for task in range(first_task(bid, base), n_inproj, BLOCKS):
+                n0 = (task % tn) * g.bn
+                sk = (task // tn) % g.ks
+                m0 = (task // (tn * g.ks)) * g.bm
+                tile_dma.dma_tile(
+                    tid, x_a, HIDDEN, rows, m0, w_in, HIDDEN, kda.NPROJ, n0, sk * kt, kt,
+                    g.bm, g.bn, g.wm, g.wn, ab, None, g.bk, g.stages,
+                    atomic_lin(proj, kda.NPROJ, n0, rows, kda.NPROJ, True), cl, CM_DEV,
+                    wait_x=lambda: _wait_words(
+                        tid, fx.min(g.bm, rows - m0), scratch, sc["xflag"] + m0 + tid, ep + 1
+                    ),
+                )
+                _count(tid, cnt_p + fx.Int64((task % tn) * CNT_STRIDE * 4))
+            stamp(3)
+            # ---- kda
+            base += n_inproj
+
+            def wait_proj(n, hv):
+                tile, nt = _head_tiles(hv, g.bn, tid)
+                _wait_words(tid, nt, scratch, sc["cnt_p"] + tile * CNT_STRIDE, (ep + 1) * g.ks * tm)
+
+            kc = dict(
+                TT=tt, tid=tid, lower_bound=lower_bound, onorm_eps=onorm_eps,
+                state_bf16=state_bf16, has_iw=has_iw, proj_cm=CM_DEV, out_cm=CM_DEV,
+                wait_proj=wait_proj,
+                head_done=lambda n, hv: _flag(tid, scratch, sc["kflag"] + n * kda.NH + hv, ep + 1),
+                args=dict(
+                    proj=proj, conv_w=conv_w, conv_st=conv_st, cs_idx=cs_idx, iw=iw,
+                    iw_idx=iw_idx, w_fgb=w_fgb, a_log=a_log, dt_bias=dt_bias, state=state,
+                    h0_idx=h0_idx, rawv=rawv, rawk=rawk, ring_g=ring_g, ring_beta=ring_beta,
+                    ring_idx=ring_idx, on_w=on_w, core_out=core, cs_line=cs_line,
+                    cs_tok=cs_tok, iw_line=iw_line, iw_step=iw_step, iw_win=iw_win,
+                    rawv_slot=rawv_slot, rawk_slot=rawk_slot, g_slot=g_slot,
+                    beta_slot=beta_slot, ring_len=ring_len,
                 ),
             )
-            _count(tid, cnt_p + fx.Int64((task % tn) * CNT_STRIDE * 4))
-        stamp(3)
-        # ---- kda
-        base += n_inproj
-
-        def wait_proj(n, hv):
-            tile, nt = _head_tiles(hv, g.bn, tid)
-            _wait_words(tid, nt, scratch, sc["cnt_p"] + tile * CNT_STRIDE, (ep + 1) * g.ks * tm)
-
-        kc = dict(
-            TT=tt, tid=tid, lower_bound=lower_bound, onorm_eps=onorm_eps,
-            state_bf16=state_bf16, has_iw=has_iw, proj_cm=CM_DEV, out_cm=CM_DEV,
-            wait_proj=wait_proj,
-            head_done=lambda n, hv: _flag(tid, scratch, sc["kflag"] + n * kda.NH + hv, ep + 1),
-            args=dict(
-                proj=proj, conv_w=conv_w, conv_st=conv_st, cs_idx=cs_idx, iw=iw,
-                iw_idx=iw_idx, w_fgb=w_fgb, a_log=a_log, dt_bias=dt_bias, state=state,
-                h0_idx=h0_idx, rawv=rawv, rawk=rawk, ring_g=ring_g, ring_beta=ring_beta,
-                ring_idx=ring_idx, on_w=on_w, core_out=core, cs_line=cs_line,
-                cs_tok=cs_tok, iw_line=iw_line, iw_step=iw_step, iw_win=iw_win,
-                rawv_slot=rawv_slot, rawk_slot=rawk_slot, g_slot=g_slot,
-                beta_slot=beta_slot, ring_len=ring_len,
-            ),
-        )
-        for task in range(first_task(bid, base), reqs * kda.NH, BLOCKS):
-            kda.kda_head(kc, task // kda.NH, task % kda.NH, kl)
-        stamp(4)
-        if const_expr(level >= 1):
+            for task in range(first_task(bid, base), reqs * kda.NH, BLOCKS):
+                kda.kda_head(kc, task // kda.NH, task % kda.NH, kl)
+            stamp(4)
+        if const_expr(body and level >= 1):
             co = kcoll.region_context(peers, rank, epoch, 0, poffs, half, tid, bid)
             # ---- oproj: (tile, K slice) tasks, a tile's slices consecutive
             base += reqs * kda.NH
@@ -410,7 +418,7 @@ def build(
                 for piece in range(first_task(bid, base), n_reduce, BLOCKS):
                     coll.reduce_bcast(co, piece, rows, rb_o, go.bn, tp)
             stamp(6)
-        if const_expr(level >= 2):
+        if const_expr(body and level >= 2):
             # ---- fseam: R_mid = post o + comb R, the FFN mixes
             base += n_reduce
             if const_expr(oneshot):
@@ -443,9 +451,12 @@ def build(
             for t in range(first_task(bid, base), rows, BLOCKS):
                 mhc.gate_row(mcf, t)
             stamp(8)
-        if const_expr(level >= 3):
-            # ---- router: (column tile, K slice, row tile) tasks
-            base += rows
+        if const_expr(do_route):
+            # ---- router: (column tile, K slice, row tile) tasks, on fgate's x_f (agate's
+            # x without a body)
+            if const_expr(body):
+                base += rows
+            x_r, xr_flag = (x_f, sc["xfflag"]) if body else (x_a, sc["xflag"])
             ktr = HIDDEN // gr.ks
             parts = scratch + fx.Int64(sc["parts"] * 4)
             cnt_r = scratch + fx.Int64(sc["cnt_r"] * 4)
@@ -455,12 +466,12 @@ def build(
                 mt = task // (ntr * gr.ks)
                 m0 = mt * gr.bm
                 tile_dma.dma_tile(
-                    tid, x_f, HIDDEN, rows, m0, w_r, HIDDEN, N_EXPERTS, nt * gr.bn,
+                    tid, x_r, HIDDEN, rows, m0, w_r, HIDDEN, N_EXPERTS, nt * gr.bn,
                     sk * ktr, ktr, gr.bm, gr.bn, gr.wm, gr.wn, ab,
                     route.part_emit(parts, rows, sk, nt * gr.bn), gr.bk, gr.stages, None,
                     cl, CM_DEV,
                     wait_x=lambda: _wait_words(
-                        tid, fx.min(gr.bm, rows - m0), scratch, sc["xfflag"] + m0 + tid, ep + 1
+                        tid, fx.min(gr.bm, rows - m0), scratch, xr_flag + m0 + tid, ep + 1
                     ),
                 )
                 _count(tid, cnt_r + fx.Int64((mt * ntr + nt) * CNT_STRIDE * 4))
