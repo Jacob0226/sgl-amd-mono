@@ -209,12 +209,19 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             ) + max(float((t != wts).any()) for t in gather(wts))
         if a.sort:
             bad = sort_check(sbuf, sly, ids, wts, m, m, moe_out)
+            xa0 = x_a.clone()
+            pad_bad = 0
             # fewer tokens than the bucket, then back: the previous launch's rows reset
             for mt in (max(tt, m - tt), max(1, m // 2 - 1), m):
                 moe_out.fill_(7.0)
                 go(mt)
                 torch.cuda.synchronize()
                 bad += sort_check(sbuf, sly, ids, wts, m, mt, moe_out)
+                if not a.t1:
+                    # R_in rows past mt read 0: rows below are unchanged, pad x_a is 0
+                    # (x_f is not bitwise run to run: split-K in_proj accumulates atomically)
+                    pad_bad += int((x_a[:mt] != xa0[:mt]).sum()) + int((x_a[mt:] != 0).sum())
+            errs["pad_bad"] = pad_bad
             errs["sort_bad"] = bad
     # repeated launches: the epoch hand-offs, across ranks
     for _ in range(a.launches):
@@ -252,7 +259,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     peers.close()
     tol = {"R_in": 1e-6, "rin_ranks": 0.0, "x_a": 1e-3, "post_a": 1e-5, "comb_a": 1e-5, "core": 1e-6, "proj": 1e-2, "o": 1e-2, "o_ranks": 0.0, "R_mid": 1e-6, "x_f": 1e-3,
            "post_f": 1e-5, "comb_f": 1e-5, "xf_ranks": 0.0, "ids_bad": 0, "w": 1e-5, "logits": 1e-5,
-           "shared": 0, "route_ranks": 0.0, "sort_bad": 0, "ring_bad": 0}
+           "shared": 0, "route_ranks": 0.0, "sort_bad": 0, "ring_bad": 0, "pad_bad": 0}
     return all(errs[k] <= v for k, v in tol.items() if k in errs)
 
 
