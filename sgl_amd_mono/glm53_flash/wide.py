@@ -417,8 +417,11 @@ class Wide:
                 )
                 i += 1
                 continue
-            # a run of covered layers, from the written streams
-            bufs["r_in"][:rows].copy_(hidden.view(rows, HC, HIDDEN))
+            # a run of covered layers, from the written streams (the first launch reads
+            # SGLang's rows in place; the bucket's pad rows read 0)
+            r0 = hidden.view(rows, HC, HIDDEN)
+            if not r0.is_contiguous():
+                r0 = bufs["r_in"][:rows].copy_(r0)
             run = []
             while i in self.layers:
                 run.append(i)
@@ -426,7 +429,7 @@ class Wide:
             for n, li in enumerate(run):
                 ly = self.layers[li]
                 prev, cur = bufs["out"][ping], bufs["out"][1 - ping]
-                r_in = bufs["r_in"] if n == 0 else prev["res_mid"]
+                r_in = r0 if n == 0 else prev["res_mid"]
                 self._launch(ly, b, bufs, n > 0, prev, cur, r_in, rows)
                 self._experts(ly, cur, rows, bufs)
                 ping = 1 - ping

@@ -109,9 +109,11 @@ def tasks(s):
     return SLICES * bands(s)
 
 
-def _ld_row8(ptr, elem, cm=0):
+def _ld_row8(ptr, elem, cm=0, nbytes=None):
     """bf16 elements elem .. elem + 7 -> 8 f32."""
-    w = fx.Vector(bo.buffer_load(rsrc(ptr), elem // 2, vec_width=4, dtype=T.i32, cache_modifier=cm))
+    w = fx.Vector(
+        bo.buffer_load(rsrc(ptr, nbytes), elem // 2, vec_width=4, dtype=T.i32, cache_modifier=cm)
+    )
     return [v for e in range(4) for v in bf2_f32(fx.Int32(w[e]))]
 
 
@@ -125,9 +127,10 @@ def _slice_loads(c, c0, tb, u):
     a = c["args"]
     t, _, o, col = _slice_at(c0, tb, u)
     ccm = c.get("cm", 0)
+    nb = a.get("res_bytes")  # rows past it read 0 (a caller's residual of fewer rows)
     if const_expr(a.get("x_in") is None):
-        return (_ld_row8(a["res_in"], (t * HC + o) * HIDDEN + col, ccm),)
-    r = [_ld_row8(a["res_in"], (t * HC + i) * HIDDEN + col, ccm) for i in range(HC)]
+        return (_ld_row8(a["res_in"], (t * HC + o) * HIDDEN + col, ccm, nb),)
+    r = [_ld_row8(a["res_in"], (t * HC + i) * HIDDEN + col, ccm, nb) for i in range(HC)]
     cm = [ld_f32(a["comb_in"], (t * HC + i) * HC + o, ccm) for i in range(HC)]
     if const_expr(a.get("x_parts") is None):
         x = _ld_row8(a["x_in"], t * HIDDEN + col, c.get("x_cm", ccm))
@@ -285,6 +288,7 @@ def gate_row(c, t):
     red = c["red"]
     a = c["args"]
     r_src = a["res_out"] if const_expr(a.get("x_in") is not None) else a["res_in"]
+    r_nb = None if const_expr(a.get("x_in") is not None) else a.get("res_bytes")
     ccm = c.get("cm", 0)
     groups = SLICES // GATE_BLOCK
     col = tid * CPT
@@ -293,7 +297,7 @@ def gate_row(c, t):
         return [
             fx.Vector(
                 bo.buffer_load(
-                    rsrc(r_src),
+                    rsrc(r_src, r_nb),
                     ((t * HC + i) * HIDDEN + col) // 2,
                     vec_width=CPT // 2,
                     dtype=T.i32,
