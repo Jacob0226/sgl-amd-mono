@@ -166,7 +166,7 @@ class Wide:
 
         return lay.build(
             b, self.L, TP, self.lower_bound, self.onorm_eps, self.state_bf16, True,
-            "route", shared_w=1.0, t1=t1,
+            "route", shared_w=1.0, t1=t1, moe_sort=True,
         )
 
     def _ensure(self, b):
@@ -176,7 +176,7 @@ class Wide:
             return self.bufs[b]
         from sgl_amd_mono.common.peer import PeerBuffer
         from sgl_amd_mono.glm53_flash.gfx950.config import MOE_SLOTS, N_EXPERTS
-        from sgl_amd_mono.glm53_flash.gfx950.wide import kda
+        from sgl_amd_mono.glm53_flash.gfx950.wide import kda, sort
 
         assert MOE_SLOTS == TOPK_SLOTS
         dev, bf, f32, i32 = self.device, torch.bfloat16, torch.float32, torch.int32
@@ -206,8 +206,12 @@ class Wide:
             )
 
         R = b // self.L
+        # the launch's MoE sort (AITER's BM16 aux layout), at rest all pad
+        sly = sort.layout(b)
+        sbuf = torch.empty(sly["nbytes"], dtype=torch.uint8, device=dev)
+        sort.init(sbuf, b)
         bufs = dict(
-            var=var, r_in=z(b, HC, HIDDEN), out=[out(), out()],
+            var=var, r_in=z(b, HC, HIDDEN), out=[out(), out()], sbuf=sbuf, sly=sly,
             x_a=z(b, HIDDEN), post_a=z(b, HC, dt=f32), comb_a=z(b, HC * HC, dt=f32),
             proj=z(b, kda.NPROJ), core=z(b, kda.P), acc_o=z(b, HIDDEN),
             slots=torch.full((R,), -1, dtype=i32, device=dev),
@@ -279,7 +283,7 @@ class Wide:
         ly.cache = (conv, iw, state, *ring)
 
     # ------------------------------------------------------------ one launch
-    def _launch(self, ly, b, bufs, t1, prev, cur, r_in):
+    def _launch(self, ly, b, bufs, t1, prev, cur, r_in, m):
         v = bufs["var"][t1]
         conv, iw, state, rawv, rawk, g, beta = ly.cache
         hc_fn, hc_scale, hc_base, g_norm, w_in, conv_w, w_fgb, a_log, dt_bias, on_w, w_o = (
@@ -301,20 +305,34 @@ class Wide:
         )
         v["launch"](
             *[t.data_ptr() for t in ptrs], v["peers"].addresses.data_ptr(), self.rank,
-            *ints, stream=torch.cuda.current_stream(),
+            *ints, bufs["sbuf"].data_ptr(), cur["moe"].data_ptr(), m,
+            stream=torch.cuda.current_stream(),
         )
 
-    def _experts(self, ly, cur, rows):
+    def _experts(self, ly, cur, rows, bufs):
         """SGLang's routed experts (the fused shared expert at slot 8) on the
         launch's FFN input and (ids, weights): this rank's partial -> cur["moe"], which
-        aiter writes directly (``aiter_moe_output``)."""
+        aiter writes directly (``aiter_moe_output``), from the launch's sort and zeroing
+        (``register_presorted_moe``): only the two GEMMs run."""
+        from aiter.presorted_moe import register_presorted_moe
         from sglang.srt.layers.moe.topk import build_precomputed_topk_output
         from sglang.srt.runtime_context import get_forward
+
+        from sgl_amd_mono.glm53_flash.gfx950.config import N_EXPERTS
+        from sgl_amd_mono.glm53_flash.gfx950.wide import sort
 
         moe = ly.moe
         out = cur["moe"][:rows]
         topk = build_precomputed_topk_output(
             cur["wts"][:rows], cur["ids"][:rows], moe.topk.topk_config, ly.i
+        )
+        register_presorted_moe(
+            dict(
+                sort.views(bufs["sbuf"], bufs["sly"], rows),
+                topk_ids_ptr=cur["ids"].data_ptr(), topk_weights_ptr=cur["wts"].data_ptr(),
+                M=rows, block_m=sort.BM, num_experts=N_EXPERTS + 1, topk=TOPK_SLOTS,
+                moe_buf_zeroed=True, moe_buf_ptr=out.data_ptr(),
+            )
         )
         with get_forward().scoped(aiter_moe_output=out):
             y = moe.experts(cur["x_f"][:rows], topk)
@@ -349,8 +367,8 @@ class Wide:
             for b in self.buckets:
                 bufs = self._ensure(b)
                 o0, o1 = bufs["out"]
-                self._launch(ly, b, bufs, False, o1, o0, bufs["r_in"])
-                self._launch(ly, b, bufs, True, o0, o1, o0["res_mid"])
+                self._launch(ly, b, bufs, False, o1, o0, bufs["r_in"], b)
+                self._launch(ly, b, bufs, True, o0, o1, o0["res_mid"], b)
             torch.cuda.synchronize()
         finally:
             ly.cache = saved
@@ -409,8 +427,8 @@ class Wide:
                 ly = self.layers[li]
                 prev, cur = bufs["out"][ping], bufs["out"][1 - ping]
                 r_in = bufs["r_in"] if n == 0 else prev["res_mid"]
-                self._launch(ly, b, bufs, n > 0, prev, cur, r_in)
-                self._experts(ly, cur, rows)
+                self._launch(ly, b, bufs, n > 0, prev, cur, r_in, rows)
+                self._experts(ly, cur, rows, bufs)
                 ping = 1 - ping
             # leave: the last layer's MoE all-reduce and mHC write-back on SGLang
             last, o = self.layers[run[-1]], bufs["out"][ping]
