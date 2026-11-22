@@ -169,6 +169,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     kl(*[t.data_ptr() for t in kp], *ints, stream=torch.cuda.current_stream())
     torch.cuda.synchronize()
     errs["core"] = rel(mine["core"], ref["core"])
+    errs["ring_bad"] = sum(int((mine[k] != ref[k]).sum()) for k in ("rawv", "rawk", "ring_g", "ring_beta", "iw"))
     errs["proj"] = rel(proj, (x_a.float() @ w_in.float().T).to(torch.bfloat16))
     if a.stop != "kda":
         offs, half = coll.layout(m, plan["rb_o"], plan["oproj"].bn, tp, plan["oneshot"], plan["t1"])
@@ -251,7 +252,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     peers.close()
     tol = {"R_in": 1e-6, "rin_ranks": 0.0, "x_a": 1e-3, "post_a": 1e-5, "comb_a": 1e-5, "core": 1e-6, "proj": 1e-2, "o": 1e-2, "o_ranks": 0.0, "R_mid": 1e-6, "x_f": 1e-3,
            "post_f": 1e-5, "comb_f": 1e-5, "xf_ranks": 0.0, "ids_bad": 0, "w": 1e-5, "logits": 1e-5,
-           "shared": 0, "route_ranks": 0.0, "sort_bad": 0}
+           "shared": 0, "route_ranks": 0.0, "sort_bad": 0, "ring_bad": 0}
     return all(errs[k] <= v for k, v in tol.items() if k in errs)
 
 
