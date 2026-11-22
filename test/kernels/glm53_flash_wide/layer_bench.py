@@ -116,7 +116,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     res_cur = z(m, HC, HIDDEN, dt=torch.bfloat16)
     launch = layer.build(
         m, tt, tp, LB, ONORM_EPS, bool(sbf), True, a.stop, trace=a.trace,
-        oneshot=m <= a.oneshot_rows, t1=a.t1, moe_sort=a.sort,
+        oneshot=m <= a.oneshot_rows, t1=a.t1, moe_sort=a.sort, body=not a.no_body,
     )
     plan = launch.plan
     epoch = z(plan["epoch_words"], dt=torch.int32)
@@ -162,16 +162,24 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     errs["x_a"] = rel(x_a, rmsnorm_ref(lia, fa["norm"]))
     errs["post_a"] = rel(post_a, pa_ref)
     errs["comb_a"] = rel(comb_a, ca_ref)
+    if a.no_body:
+        if a.stop == "route":
+            errs.update(route_check(x_a, w_r, bias_r, ids, wts))
+            errs["logits"] = rel(logits, x_a.float() @ w_r.float().T)
+            errs["route_ranks"] = max(
+                float((t != ids).any()) for t in gather(ids)
+            ) + max(float((t != wts).any()) for t in gather(wts))
     # core: the KDA task alone on our proj
     kl = kda.standalone(reqs, tt, LB, ONORM_EPS, bool(sbf), True)
     kp = (proj, conv_w, conv_st, cs_idx, ref["iw"], idx, w_fgb, a_log, dt_bias, state, idx,
           ref["rawv"], ref["rawk"], ref["ring_g"], ref["ring_beta"], idx, on_w, ref["core"])
-    kl(*[t.data_ptr() for t in kp], *ints, stream=torch.cuda.current_stream())
-    torch.cuda.synchronize()
-    errs["core"] = rel(mine["core"], ref["core"])
-    errs["ring_bad"] = sum(int((mine[k] != ref[k]).sum()) for k in ("rawv", "rawk", "ring_g", "ring_beta", "iw"))
-    errs["proj"] = rel(proj, (x_a.float() @ w_in.float().T).to(torch.bfloat16))
-    if a.stop != "kda":
+    if not a.no_body:
+        kl(*[t.data_ptr() for t in kp], *ints, stream=torch.cuda.current_stream())
+        torch.cuda.synchronize()
+        errs["core"] = rel(mine["core"], ref["core"])
+        errs["ring_bad"] = sum(int((mine[k] != ref[k]).sum()) for k in ("rawv", "rawk", "ring_g", "ring_beta", "iw"))
+        errs["proj"] = rel(proj, (x_a.float() @ w_in.float().T).to(torch.bfloat16))
+    if a.stop != "kda" and not a.no_body:
         offs, half = coll.layout(m, plan["rb_o"], plan["oproj"].bn, tp, plan["oneshot"], plan["t1"])
         par = (epoch[0].item() - 1) % 2
         if plan["oneshot"]:
@@ -207,22 +215,22 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             errs["route_ranks"] = max(
                 float((t != ids).any()) for t in gather(ids)
             ) + max(float((t != wts).any()) for t in gather(wts))
-        if a.sort:
-            bad = sort_check(sbuf, sly, ids, wts, m, m, moe_out)
-            xa0 = x_a.clone()
-            pad_bad = 0
-            # fewer tokens than the bucket, then back: the previous launch's rows reset
-            for mt in (max(tt, m - tt), max(1, m // 2 - 1), m):
-                moe_out.fill_(7.0)
-                go(mt)
-                torch.cuda.synchronize()
-                bad += sort_check(sbuf, sly, ids, wts, m, mt, moe_out)
-                if not a.t1:
-                    # R_in rows past mt read 0: rows below are unchanged, pad x_a is 0
-                    # (x_f is not bitwise run to run: split-K in_proj accumulates atomically)
-                    pad_bad += int((x_a[:mt] != xa0[:mt]).sum()) + int((x_a[mt:] != 0).sum())
-            errs["pad_bad"] = pad_bad
-            errs["sort_bad"] = bad
+    if a.sort and a.stop == "route":
+        bad = sort_check(sbuf, sly, ids, wts, m, m, moe_out)
+        xa0 = x_a.clone()
+        pad_bad = 0
+        # fewer tokens than the bucket, then back: the previous launch's rows reset
+        for mt in (max(tt, m - tt), max(1, m // 2 - 1), m):
+            moe_out.fill_(7.0)
+            go(mt)
+            torch.cuda.synchronize()
+            bad += sort_check(sbuf, sly, ids, wts, m, mt, moe_out)
+            if not a.t1:
+                # R_in rows past mt read 0: rows below are unchanged, pad x_a is 0
+                # (x_f is not bitwise run to run: split-K in_proj accumulates atomically)
+                pad_bad += int((x_a[:mt] != xa0[:mt]).sum()) + int((x_a[mt:] != 0).sum())
+        errs["pad_bad"] = pad_bad
+        errs["sort_bad"] = bad
     # repeated launches: the epoch hand-offs, across ranks
     for _ in range(a.launches):
         go()
@@ -321,13 +329,14 @@ def main():
     ap.add_argument("--reqs", default="3,6,16")
     ap.add_argument("--tt", type=int, default=6)
     ap.add_argument("--state-bf16", default="1")
-    ap.add_argument("--stop", default="route", choices=layer.STOPS)
+    ap.add_argument("--stop", default="route", choices=layer.STOPS + ("agate",))
     ap.add_argument("--launches", type=int, default=10)
     ap.add_argument("--time", action="store_true")
     ap.add_argument("--oneshot-rows", type=int, default=0)
     ap.add_argument("--t1", action="store_true")
     ap.add_argument("--trace", action="store_true")
     ap.add_argument("--sort", action="store_true")
+    ap.add_argument("--no-body", action="store_true", help="a DSA layer's seam launch (stop agate / route)")
     a = ap.parse_args()
     rank = int(os.environ["RANK"])
     tp = int(os.environ["WORLD_SIZE"])

@@ -3,8 +3,11 @@
 requests runs one persistent launch a KDA + MoE layer, from the attention's mHC
 read through the router's top-8 (and, past a run's first layer, the previous
 layer's MoE all-reduce and mHC write-back), SGLang's routed experts between
-launches, and SGLang's own path for the dense layers, the DSA layers and each run's
-exit (the MoE all-reduce and ``hc_post``).
+launches, and SGLang's own path for the dense layers and each run's exit (the MoE
+all-reduce and ``hc_post``). A DSA + MoE layer joins the run as two seam launches
+around SGLang's DSA attention (``SGLANG_AMD_MONO_GLM53_WIDE_DSA``, on by default):
+the previous MoE's exit and the attention input, then the attention's all-reduce,
+the FFN input and its route.
 
 The KDA stage is SGLang's ring verify (``enable_linear_replayssm_spec``): it reads
 the committed conv and recurrent state, writes every draft token's conv window and
@@ -56,6 +59,18 @@ def is_covered(layer) -> bool:
     return bool(layer.is_linear_attn) and isinstance(layer.mlp, Glm5NextMoE)
 
 
+def is_dsa_covered(layer) -> bool:
+    """A DSA layer with the routed MoE: its seams run on the wide launch."""
+    from sglang.srt.models.glm5_next import Glm5NextMoE
+
+    return (
+        os.environ.get("SGLANG_AMD_MONO_GLM53_WIDE_DSA", "1") == "1"
+        and not layer.is_linear_attn
+        and isinstance(layer.mlp, Glm5NextMoE)
+        and moe_reason(layer.mlp) is None
+    )
+
+
 def moe_reason(moe) -> str | None:
     """Why SGLang's routed experts cannot take the launch's (ids, weights), or None:
     the launch routes as SGLang's own top-k does for this model (sigmoid + bias,
@@ -87,6 +102,30 @@ def moe_reason(moe) -> str | None:
     return ", ".join(bad) if bad else None
 
 
+def _router(i, moe, copies):
+    """The router in bf16 and its bias in f32, as the launch reads them."""
+    gate = moe.gate
+    w_r = gate.weight
+    if w_r.dtype != torch.bfloat16:
+        r16 = w_r.to(torch.bfloat16)
+        if not torch.equal(r16.float(), w_r):
+            raise ValueError("needs router weights exactly representable in bf16")
+        w_r = copies["wide router bf16", i] = r16.contiguous()
+    bias = gate.e_score_correction_bias
+    if bias.dtype != torch.float32:
+        bias = copies["wide router bias f32", i] = bias.float().contiguous()
+    return w_r.contiguous(), bias.contiguous()
+
+
+def _ffn_mhc(module):
+    ffn = (
+        module.hc_ffn_fn, module.hc_ffn_scale, module.hc_ffn_base,
+        module.post_attention_layernorm.weight,
+    )
+    assert all(t.dtype == torch.float32 for t in ffn[:3])
+    return ffn
+
+
 class _Layer:
     """A covered layer's weights as the launch reads them: views of SGLang's
     parameters (``weights.kda_weights``), the router in bf16 and its bias in f32."""
@@ -96,16 +135,6 @@ class _Layer:
 
         self.i, self.module, self.moe = i, module, module.mlp
         a = kda_weights(module, i, TP, copies)
-        gate = self.moe.gate
-        w_r = gate.weight
-        if w_r.dtype != torch.bfloat16:
-            r16 = w_r.to(torch.bfloat16)
-            if not torch.equal(r16.float(), w_r):
-                raise ValueError("needs router weights exactly representable in bf16")
-            w_r = copies["wide router bf16", i] = r16.contiguous()
-        bias = gate.e_score_correction_bias
-        if bias.dtype != torch.float32:
-            bias = copies["wide router bias f32", i] = bias.float().contiguous()
         attn = module.self_attn
         self.onorm_eps = float(getattr(attn.o_norm, "eps", HF_CONFIG["rms_norm_eps"]))
         # the launch's f_b | g_b: SGLang's [2, P, D] parameter, which a.w_fb / w_gb view
@@ -116,13 +145,25 @@ class _Layer:
             a.hc_fn, a.hc_scale, a.hc_base, a.g_norm, a.w_in, a.conv_w, w_fgb,
             a.a_log, a.dt_bias, a.w_on, a.w_o,
         )
-        self.ffn = (
-            module.hc_ffn_fn, module.hc_ffn_scale, module.hc_ffn_base,
-            module.post_attention_layernorm.weight,
-        )
-        assert all(t.dtype == f32 for t in self.ffn[:3])
-        self.w_r, self.bias = w_r.contiguous(), bias.contiguous()
+        self.ffn = _ffn_mhc(module)
+        self.w_r, self.bias = _router(i, self.moe, copies)
         self.cache = None  # (conv, iw, state, rawv, rawk, g, beta) bound at first use
+
+
+class _DsaLayer:
+    """A DSA + MoE layer's seams: the attention and FFN mHC (views of SGLang's
+    parameters) and the router."""
+
+    def __init__(self, i, module, copies):
+        self.i, self.module, self.moe = i, module, module.mlp
+        attn = (
+            module.hc_attn_fn, module.hc_attn_scale, module.hc_attn_base,
+            module.input_layernorm.weight,
+        )
+        assert all(t.dtype == torch.float32 for t in attn[:3])
+        assert attn[3].dtype == torch.bfloat16 and attn[3].shape == (HIDDEN,)
+        self.attn, self.ffn = attn, _ffn_mhc(module)
+        self.w_r, self.bias = _router(i, self.moe, copies)
 
 
 class Wide:
@@ -137,6 +178,8 @@ class Wide:
         self.state_bf16 = state_bf16
         idx = [i for i in range(bb.start_layer, bb.end_layer) if is_covered(bb.layers[i])]
         self.layers = {i: _Layer(i, bb.layers[i], copies) for i in idx}
+        didx = [i for i in range(bb.start_layer, bb.end_layer) if is_dsa_covered(bb.layers[i])]
+        self.dsa = {i: _DsaLayer(i, bb.layers[i], copies) for i in didx}
         eps = {ly.onorm_eps for ly in self.layers.values()}
         assert len(eps) == 1, eps
         self.onorm_eps = eps.pop()
@@ -147,7 +190,7 @@ class Wide:
         self.kda_ready = False
         runs, cur = [], []
         for i in range(bb.start_layer, bb.end_layer):
-            if i in self.layers:
+            if i in self.layers or i in self.dsa:
                 cur.append(i)
             elif cur:
                 runs.append(cur)
@@ -155,19 +198,27 @@ class Wide:
         if cur:
             runs.append(cur)
         _say(
-            f"{len(idx)} covered layers in {len(runs)} runs "
+            f"{len(idx)} covered layers and {len(didx)} DSA layers' seams in {len(runs)} runs "
             f"({', '.join(f'{r[0]}..{r[-1]}' for r in runs)}), {L} tokens a request, "
             f"buckets {self.buckets}, state {'bf16' if state_bf16 else 'f32'}"
         )
 
     # ------------------------------------------------------------ per bucket
-    def _build(self, b, t1):
+    # (kind, t1): a KDA layer's launch, a DSA layer's seam before ("a") and after
+    # ("b") its attention
+    KINDS = (("kda", False), ("kda", True), ("a", False), ("a", True), ("b", True))
+
+    def _build(self, b, kind, t1):
         from sgl_amd_mono.glm53_flash.gfx950.wide import layer as lay
 
+        body, stop = (True, "route") if kind == "kda" else (False, "agate" if kind == "a" else "route")
         return lay.build(
             b, self.L, TP, self.lower_bound, self.onorm_eps, self.state_bf16, True,
-            "route", shared_w=1.0, t1=t1, moe_sort=True,
+            stop, shared_w=1.0, t1=t1, moe_sort=stop == "route", body=body,
         )
+
+    def _kinds(self):
+        return self.KINDS if self.dsa else self.KINDS[:2]
 
     def _ensure(self, b):
         """Bucket b's launches, collective state and activations (the peer buffers'
@@ -187,12 +238,12 @@ class Wide:
         # one epoch, scratch and peer buffer a build: a build's counters and flags
         # move on once a launch of it, and the two builds' layouts differ
         var = {}
-        for t1 in (False, True):
-            launch = self._build(b, t1)
+        for kind, t1 in self._kinds():
+            launch = self._build(b, kind, t1)
             pl = launch.plan
             pb = PeerBuffer(pl["peer_bytes"], self.group, self.rank, TP, dev)
             pb.bytes.zero_()
-            var[t1] = dict(
+            var[kind, t1] = dict(
                 launch=launch, peers=pb,
                 epoch=z(pl["epoch_words"], dt=i32), scratch=z(pl["scratch_words"], dt=i32),
             )
@@ -217,11 +268,14 @@ class Wide:
             slots=torch.full((R,), -1, dtype=i32, device=dev),
             iw_idx=torch.full((R,), -1, dtype=i32, device=dev),
             ring_idx=torch.full((R,), -1, dtype=i32, device=dev),
+            # a DSA layer's attention input, its mixes and the streams it reads
+            dsa=dict(x=z(b, HIDDEN), post=z(b, HC, dt=f32), comb=z(b, HC * HC, dt=f32),
+                     res=z(b, HC, HIDDEN)),
         )
         self.bufs[b] = bufs
         _say(
             f"bucket {b}: peers "
-            f"{', '.join(f't1={k} {v['peers'].bytes.numel() / 1e6:.1f} MB' for k, v in var.items())}"
+            f"{', '.join(f'{k[0]} t1={int(k[1])} {v['peers'].bytes.numel() / 1e6:.1f} MB' for k, v in var.items())}"
         )
         return bufs
 
@@ -284,7 +338,7 @@ class Wide:
 
     # ------------------------------------------------------------ one launch
     def _launch(self, ly, b, bufs, t1, prev, cur, r_in, m):
-        v = bufs["var"][t1]
+        v = bufs["var"]["kda", t1]
         conv, iw, state, rawv, rawk, g, beta = ly.cache
         hc_fn, hc_scale, hc_base, g_norm, w_in, conv_w, w_fgb, a_log, dt_bias, on_w, w_o = (
             ly.ptr_a
@@ -308,6 +362,55 @@ class Wide:
             *ints, bufs["sbuf"].data_ptr(), cur["moe"].data_ptr(), m,
             stream=torch.cuda.current_stream(),
         )
+
+    def _seam(self, bufs, kind, t1, mhc4, out4, r_in, prev, ly, cur, m):
+        """A DSA layer's seam launch: [t1: fold prev's partial (prev["moe"], post_f,
+        comb_f) into r_in] mHC pre with ``mhc4`` (fn, scale, base, norm) -> out4 (x,
+        post, comb, streams); kind "b" routes x with ly's router into cur's ids /
+        weights, sorts and zeroes cur["moe"]."""
+        v = bufs["var"][kind, t1]
+        x, post, comb, res = out4
+        p = lambda t: 0 if t is None else t.data_ptr()  # noqa: E731
+        route = kind == "b"
+        ptrs = (
+            [p(r_in), *[p(t) for t in mhc4], p(x), p(post), p(comb)]
+            + [0] * 21  # in_proj, KDA, o_proj: no body
+            + [0] * 8  # FFN mHC, R_mid, x_f, post_f, comb_f: no body
+            + ([p(ly.w_r), p(ly.bias), p(cur["ids"]), p(cur["wts"]), p(cur["logits"])]
+               if route else [0] * 5)
+            + [p(prev["moe"]) if t1 else 0, p(prev["post_f"]) if t1 else 0,
+               p(prev["comb_f"]) if t1 else 0, p(res)]
+            + [p(v["epoch"]), p(v["scratch"])]
+        )
+        assert len(ptrs) == 48, len(ptrs)
+        v["launch"](
+            *ptrs, v["peers"].addresses.data_ptr(), self.rank, *([0] * 10),
+            bufs["sbuf"].data_ptr() if route else 0, p(cur["moe"]) if route else 0, m,
+            stream=torch.cuda.current_stream(),
+        )
+
+    def _attention(self, dl, positions, x, fb, zero_allocator):
+        """SGLang's DSA attention on the seam's x: this rank's o_proj partial."""
+        from sglang.srt.layers.layer_boundary.adapters.attention import (
+            AttentionInputs,
+            get_attn_tp_context,
+        )
+
+        attn = dl.module.self_attn
+        ctx = get_attn_tp_context()
+        ctx.set_attn_inputs(AttentionInputs(x, fb, attn.prepare_qkv_latent))
+        try:
+            o = attn(
+                positions=positions, hidden_states=x, forward_batch=fb,
+                zero_allocator=zero_allocator, input_on_attn_tp_slices=False,
+                prev_topk_indices=None,
+            )
+        finally:
+            ctx.clear_attn_inputs()
+        if isinstance(o, tuple):
+            o = o[0]
+        assert o.dtype == torch.bfloat16 and o.shape == (x.shape[0], HIDDEN), (o.dtype, o.shape)
+        return o.contiguous()
 
     def _experts(self, ly, cur, rows, bufs):
         """SGLang's routed experts (the fused shared expert at slot 8) on the
@@ -341,8 +444,8 @@ class Wide:
 
     # ------------------------------------------------------------ the step
     def warmup(self):
-        """Build and run every bucket's two launches once on dummy activations with
-        no KDA rows (every index -1), in one order on every rank, before any step."""
+        """Build and run every bucket's launches once on dummy activations with no
+        KDA rows (every index -1), in one order on every rank, before any step."""
         import time
 
         t0 = time.time()
@@ -369,10 +472,19 @@ class Wide:
                 o0, o1 = bufs["out"]
                 self._launch(ly, b, bufs, False, o1, o0, bufs["r_in"], b)
                 self._launch(ly, b, bufs, True, o0, o1, o0["res_mid"], b)
+                if self.dsa:
+                    dl, d = next(iter(self.dsa.values())), bufs["dsa"]
+                    out4 = (d["x"], d["post"], d["comb"], d["res"])
+                    self._seam(bufs, "a", False, dl.attn, out4, bufs["r_in"], None, dl, None, b)
+                    self._seam(bufs, "a", True, dl.attn, out4, o1["res_mid"], o1, dl, None, b)
+                    fin = dict(moe=d["x"], post_f=d["post"], comb_f=d["comb"])
+                    out4 = (o0["x_f"], o0["post_f"], o0["comb_f"], o0["res_mid"])
+                    self._seam(bufs, "b", True, dl.ffn, out4, d["res"], fin, dl, o0, b)
             torch.cuda.synchronize()
         finally:
             ly.cache = saved
-        _say(f"warmup: {2 * len(self.buckets)} launches built and run in {time.time() - t0:.0f} s")
+        n = len(self._kinds()) * len(self.buckets)
+        _say(f"warmup: {n} launches built and run in {time.time() - t0:.0f} s")
 
     def backbone(self, input_ids, positions, fb):
         """``Glm5NextModel.forward`` with each run of covered layers on the wide
@@ -410,7 +522,7 @@ class Wide:
         topk_indices = None
         i, ping = m.start_layer, 0
         while i < m.end_layer:
-            if i not in self.layers:
+            if i not in self.layers and i not in self.dsa:
                 hidden, topk_indices = m.layers[i](
                     positions, hidden, fb, zero_allocator, gz,
                     prev_topk_indices=topk_indices,
@@ -419,22 +531,41 @@ class Wide:
                 continue
             # a run of covered layers, from the written streams (the first launch reads
             # SGLang's rows in place; the bucket's pad rows read 0)
+            if rb.stream_of(fb).pending is not None:
+                raise RuntimeError(f"wide run at layer {i}: a residual update is still pending")
             r0 = hidden.view(rows, HC, HIDDEN)
             if not r0.is_contiguous():
                 r0 = bufs["r_in"][:rows].copy_(r0)
             run = []
-            while i in self.layers:
+            while i in self.layers or i in self.dsa:
                 run.append(i)
                 i += 1
+            d = bufs["dsa"]
             for n, li in enumerate(run):
-                ly = self.layers[li]
                 prev, cur = bufs["out"][ping], bufs["out"][1 - ping]
                 r_in = r0 if n == 0 else prev["res_mid"]
-                self._launch(ly, b, bufs, n > 0, prev, cur, r_in, rows)
+                if li in self.layers:
+                    ly = self.layers[li]
+                    self._launch(ly, b, bufs, n > 0, prev, cur, r_in, rows)
+                else:
+                    # seam a, SGLang's attention, seam b (the attention's all-reduce)
+                    ly = self.dsa[li]
+                    self._seam(
+                        bufs, "a", n > 0, ly.attn, (d["x"], d["post"], d["comb"], d["res"]),
+                        r_in, prev, ly, None, rows,
+                    )
+                    o = self._attention(ly, positions, d["x"][:rows], fb, zero_allocator)
+                    self._seam(
+                        bufs, "b", True, ly.ffn,
+                        (cur["x_f"], cur["post_f"], cur["comb_f"], cur["res_mid"]),
+                        d["res"] if n > 0 else r_in,
+                        dict(moe=o, post_f=d["post"], comb_f=d["comb"]), ly, cur, rows,
+                    )
                 self._experts(ly, cur, rows, bufs)
                 ping = 1 - ping
             # leave: the last layer's MoE all-reduce and mHC write-back on SGLang
-            last, o = self.layers[run[-1]], bufs["out"][ping]
+            last = self.layers.get(run[-1]) or self.dsa[run[-1]]
+            o = bufs["out"][ping]
             x = tensor_model_parallel_all_reduce(o["moe"][:rows])
             hidden = last.module.hc_post(
                 x, o["res_mid"][:rows].view(rows, -1), o["comb_f"][:rows],
