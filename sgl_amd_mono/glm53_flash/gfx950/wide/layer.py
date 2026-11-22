@@ -279,6 +279,8 @@ def build(
             return store
 
         base = 0
+        # R_in may be the caller's own residual of m_tok rows: pad rows read 0
+        res_bytes = fx.Int32(m_tok) * (mhc.HC * HIDDEN * 2)
         if const_expr(t1):
             ct = coll.prefixed(
                 kcoll.region_context(peers, rank, epoch, 0, poffs, half, tid, bid), "t_"
@@ -298,13 +300,12 @@ def build(
                 coll.reduce_bcast(ct, piece, rows, rb_o, go.bn, tp)
             base += n_treduce
             r_attn = res_cur
-            a_in = dict(res_in=res_in, x_in=ct["ag_own"].value, post_in=post_p,
+            a_in = dict(res_in=res_in, res_bytes=res_bytes, x_in=ct["ag_own"].value, post_in=post_p,
                         comb_in=comb_p, res_out=res_cur)
             a_kw = dict(x_cm=CM_SYS)
         else:
             r_attn = res_in
-            # R_in may be the caller's own residual of m_tok rows: pad rows read 0
-            a_in = dict(res_in=res_in, res_bytes=fx.Int32(m_tok) * (mhc.HC * HIDDEN * 2))
+            a_in = dict(res_in=res_in, res_bytes=res_bytes)
             a_kw = {}
         # ---- aseam: zero this task's share of proj, then the attention mHC slice
         mca = seam_ctx(
@@ -427,7 +428,7 @@ def build(
                 o_args = dict(x_in=co["ag_own"].value)
             mcf = seam_ctx(
                 "pmix_f",
-                dict(res_in=r_attn, res_bytes=a_in.get("res_bytes"), post_in=post_a, comb_in=comb_a,
+                dict(res_in=r_attn, res_bytes=None if t1 else res_bytes, post_in=post_a, comb_in=comb_a,
                      res_out=res_mid, hc_fn=hc_fn_f, hc_scale=hc_scale_f, hc_base=hc_base_f,
                      norm_w=norm_w_f, post_out=post_f, comb_out=comb_f, **o_args),
                 x_store(x_f),
