@@ -31,7 +31,7 @@ from tile_bench import bench  # noqa: E402
 
 from sgl_amd_mono.common.peer import PeerBuffer  # noqa: E402
 from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN, MOE_SLOTS, N_EXPERTS, TOP_K  # noqa: E402
-from sgl_amd_mono.glm53_flash.gfx950.wide import coll, kda, layer, mhc  # noqa: E402
+from sgl_amd_mono.glm53_flash.gfx950.wide import coll, kda, layer, mhc, tile_dma  # noqa: E402
 from sgl_amd_mono.glm53_flash.gfx950.wide import sort as wsort  # noqa: E402
 
 HC = mhc.HC
@@ -81,6 +81,10 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     # this rank's heads
     lg = torch.Generator(device=dev).manual_seed(100 + rank)
     w_in = rnd(NPROJ, HIDDEN, scale=0.02, dt=torch.bfloat16, g=lg)
+    w_in_k = w_in
+    if a.w8:
+        w_in_k = tile_dma.pack_w8(w_in)
+        w_in = tile_dma.unpack_w8(w_in_k, NPROJ, HIDDEN)
     w_o = rnd(HIDDEN, P, scale=0.02, dt=torch.bfloat16, g=lg)
     conv_w = rnd(3 * P, 4, scale=0.3, g=lg)
     w_fgb = rnd(2, P, KD, scale=0.08, dt=torch.bfloat16, g=lg)
@@ -116,7 +120,8 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     res_cur = z(m, HC, HIDDEN, dt=torch.bfloat16)
     launch = layer.build(
         m, tt, tp, LB, ONORM_EPS, bool(sbf), True, a.stop, trace=a.trace,
-        oneshot=m <= a.oneshot_rows, t1=a.t1, moe_sort=a.sort, body=not a.no_body,
+        oneshot=m <= a.oneshot_rows, t1=a.t1, moe_sort=a.sort, body=not a.no_body, w8=a.w8,
+        band_cap=a.band_cap or None,
     )
     plan = launch.plan
     epoch = z(plan["epoch_words"], dt=torch.int32)
@@ -129,7 +134,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             mine["ring_beta"].stride(0), L)
     fa, ff = mhc_w
     ptrs = (res_in, fa["fn"], fa["scale"], fa["base"], fa["norm"], x_a, post_a, comb_a,
-            w_in, proj, conv_w, conv_st, cs_idx, mine["iw"], idx, w_fgb, a_log, dt_bias,
+            w_in_k, proj, conv_w, conv_st, cs_idx, mine["iw"], idx, w_fgb, a_log, dt_bias,
             state, idx, mine["rawv"], mine["rawk"], mine["ring_g"], mine["ring_beta"], idx,
             on_w, mine["core"], w_o, acc_o, ff["fn"], ff["scale"], ff["base"], ff["norm"],
             res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, logits, moe_in, post_p, comb_p,
@@ -247,7 +252,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
         from sgl_amd_mono.common.plan import BLOCKS
         from sgl_amd_mono.glm53_flash.gfx950.wide.m1a import TRACE_POINTS
 
-        sc = layer.scratch_layout(m, tt, True)
+        sc = layer.scratch_layout(m, tt, True, a.w8)
         acc = None
         for _ in range(20):
             go()
@@ -336,6 +341,8 @@ def main():
     ap.add_argument("--t1", action="store_true")
     ap.add_argument("--trace", action="store_true")
     ap.add_argument("--sort", action="store_true")
+    ap.add_argument("--band-cap", type=int, default=0, help="rows a mHC slice band (0: the build's default)")
+    ap.add_argument("--w8", action="store_true", help="in_proj W in FP8 (tile_dma.pack_w8)")
     ap.add_argument("--no-body", action="store_true", help="a DSA layer's seam launch (stop agate / route)")
     a = ap.parse_args()
     rank = int(os.environ["RANK"])

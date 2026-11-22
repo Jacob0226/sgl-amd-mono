@@ -53,8 +53,20 @@ INPROJ = {
 }
 
 
-def inproj_cfg(rows):
-    return INPROJ[min(w for w in INPROJ if w >= rows)]
+# the same with W in FP8 (tile_dma w8; dma_bench --w8)
+INPROJ_W8 = {
+    18: Gemm(32, 128, 2, 4, 4, 128, 4),
+    36: Gemm(48, 128, 1, 8, 4, 128, 3),
+    72: Gemm(96, 128, 2, 4, 4, 128, 4),
+    96: Gemm(96, 128, 2, 4, 4, 128, 4),
+    144: Gemm(96, 128, 2, 4, 2, 128, 4),
+    192: Gemm(96, 128, 2, 4, 2, 128, 4),
+}
+
+
+def inproj_cfg(rows, w8=False):
+    t = INPROJ_W8 if w8 else INPROJ
+    return t[min(w for w in t if w >= rows)]
 
 
 def _tiles(rows, g):

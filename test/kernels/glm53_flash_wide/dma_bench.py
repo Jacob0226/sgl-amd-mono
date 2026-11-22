@@ -40,6 +40,7 @@ def main():
     ap.add_argument("--shapes", default=SHAPES)
     ap.add_argument("--cfg", default=CFG)
     ap.add_argument("--mode", default="linbf", help="part,atom,atombf,lin,linbf (ks > 1)")
+    ap.add_argument("--w8", action="store_true", help="FP8 W with row scales (tile_dma.pack_w8)")
     a = ap.parse_args()
     if a.time:
         from aiter.tuned_gemm import tgemm
@@ -54,15 +55,20 @@ def main():
             ]
             x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
             ref = x.float() @ ws[0].float().T
+            if a.w8:
+                ws = [tile_dma.pack_w8(w) for w in ws]
+                ref = x.float() @ tile_dma.unpack_w8(ws[0], n, k).T
             tg = ""
-            if a.time:
+            if a.time and not a.w8:
                 ut = bench(lambda w: tgemm.mm(x, w, None, otype=torch.bfloat16), ws)
                 tg = f"  tgemm {ut:6.1f} us"
             for cfg, mode in ((c, md) for c in a.cfg.split(",") for md in a.mode.split(",")):
                 bm, bn, wm, wn, ks, bk, stages = map(int, cfg.split(":"))
                 if ks == 1 and mode != a.mode.split(",")[0]:
                     continue
-                if k % ks or (k // ks) % bk or (bm // wm) % 16 or (bn // wn) % 16:
+                if k % ks or (k // ks) % bk or (bm // wm) % 16 or (bn // wn) % 16 or (a.w8 and bk != 128):
+                    continue
+                if tile_dma.lds_words(bm, bn, bk, stages, a.w8) * 4 > 160 * 1024:
                     continue
                 part = ks > 1 and mode == "part"
                 shape = (ks, m, n) if part else (m, n)
@@ -74,7 +80,7 @@ def main():
                 out = torch.zeros(shape, device="cuda", dtype=dt)
                 try:
                     launch = tile_dma.standalone(
-                        m, n, k, bm, bn, wm, wn, ks, bk, stages, mode
+                        m, n, k, bm, bn, wm, wn, ks, bk, stages, mode, a.w8
                     )
 
                     def fn(w, launch=launch, out=out, part=part, ks=ks):

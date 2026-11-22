@@ -75,9 +75,9 @@ def oproj_cfg(rows):
     return OPROJ[min(w for w in OPROJ if w >= rows)]
 
 
-def scratch_layout(rows, tt, trace=False):
+def scratch_layout(rows, tt, trace=False, w8=False):
     """Word offsets in the (local) scratch buffer."""
-    g, go, gr = inproj_cfg(rows), oproj_cfg(rows), route.rgate_cfg(rows)
+    g, go, gr = inproj_cfg(rows, w8), oproj_cfg(rows), route.rgate_cfg(rows)
     offs, w = {}, 0
 
     def take(name, words, align=32):
@@ -125,12 +125,13 @@ _BUILDS: dict = {}
 
 def build(
     rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="route", trace=False,
-    shared_w=1.0, oneshot=False, t1=False, moe_sort=False, body=True,
+    shared_w=1.0, oneshot=False, t1=False, moe_sort=False, body=True, w8=False,
+    band_cap=None,
 ):
     keyed = key_tuple(locals(), SOURCES)
     key = (
         rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop, trace, shared_w,
-        oneshot, t1, moe_sort, body,
+        oneshot, t1, moe_sort, body, w8, band_cap,
     )
     if key in _BUILDS:
         return _BUILDS[key]
@@ -138,7 +139,7 @@ def build(
     level = STOPS.index(stop) if body else -1
     do_route = stop == "route"
     reqs = rows // tt
-    g = inproj_cfg(rows)
+    g = inproj_cfg(rows, w8)
     tn, tm = -(-kda.NPROJ // g.bn), -(-rows // g.bm)
     n_inproj = tn * g.ks * tm
     go = oproj_cfg(rows)
@@ -152,14 +153,15 @@ def build(
     n_reduce = 0 if oneshot else n_pieces
     pf = coll.full_pieces(rows, rb_o, go.bn)
     # a body launch spills past 48-row bands; a seam launch keeps one round of tasks
-    band_cap = 48 if body else 96
+    bc_name = f"_bc{band_cap}" if band_cap else ""
+    band_cap = band_cap or (48 if body else 96)
     n_seam = mhc.tasks(rows, band_cap)
     gr = route.rgate_cfg(rows)
     ntr, tmr = route.n_tiles(gr), -(-rows // gr.bm)
     n_router = ntr * gr.ks * tmr
     br = rows // mhc.bands(rows, band_cap)
     nbw = (br - 1) // rb_o + 2  # AG bands a slice band can touch
-    sc = scratch_layout(rows, tt, trace)
+    sc = scratch_layout(rows, tt, trace, w8)
     poffs, half = coll.layout(rows, rb_o, go.bn, tp, oneshot, t1)
     n_tpush = -(-rows // rb_o) * (HIDDEN // go.bn) if t1 else 0
     n_treduce = n_pieces if t1 else 0
@@ -173,7 +175,10 @@ def build(
         fl: fx.Array[fx.Float32, lw["fl"], 16]
         red: fx.Array[fx.Float32, lw["red"], 16]
 
-    gemm_words = max(c.stages * (c.bm + c.bn) * c.bk // 2 for c in (g, go, gr))
+    gemm_words = max(
+        c.stages * (c.bm * c.bk // 2 + c.bn * c.bk // (4 if c is g and w8 else 2))
+        for c in (g, go, gr)
+    )
     c_words = max([c.bm * (c.bn + 4) for c in (g, go)] + [route.RED_WORDS])
 
     @fx.struct
@@ -215,7 +220,7 @@ def build(
 
     @flyc.kernel(
         name=f"g53w_layer_r{rows}_t{tt}_tp{tp}_s{int(state_bf16)}_iw{int(has_iw)}_{stop}"
-        f"_tr{int(trace)}_os{int(oneshot)}_t1{int(t1)}_b{int(body)}",
+        f"_tr{int(trace)}_os{int(oneshot)}_t1{int(t1)}_b{int(body)}{'_w8' if w8 else ''}{bc_name}",
         known_block_size=[THREADS, 1, 1],
     )
     def kernel(
@@ -351,6 +356,7 @@ def build(
                     wait_x=lambda: _wait_words(
                         tid, fx.min(g.bm, rows - m0), scratch, sc["xflag"] + m0 + tid, ep + 1
                     ),
+                    w8=w8,
                 )
                 _count(tid, cnt_p + fx.Int64((task % tn) * CNT_STRIDE * 4))
             stamp(3)
