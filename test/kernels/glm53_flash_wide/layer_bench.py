@@ -32,6 +32,7 @@ from tile_bench import bench  # noqa: E402
 from sgl_amd_mono.common.peer import PeerBuffer  # noqa: E402
 from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN, MOE_SLOTS, N_EXPERTS, TOP_K  # noqa: E402
 from sgl_amd_mono.glm53_flash.gfx950.wide import coll, kda, layer, mhc  # noqa: E402
+from sgl_amd_mono.glm53_flash.gfx950.wide import sort as wsort  # noqa: E402
 
 HC = mhc.HC
 LB = -5.0
@@ -115,7 +116,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     res_cur = z(m, HC, HIDDEN, dt=torch.bfloat16)
     launch = layer.build(
         m, tt, tp, LB, ONORM_EPS, bool(sbf), True, a.stop, trace=a.trace,
-        oneshot=m <= a.oneshot_rows, t1=a.t1,
+        oneshot=m <= a.oneshot_rows, t1=a.t1, moe_sort=a.sort,
     )
     plan = launch.plan
     epoch = z(plan["epoch_words"], dt=torch.int32)
@@ -134,9 +135,14 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             res_mid, x_f, post_f, comb_f, w_r, bias_r, ids, wts, logits, moe_in, post_p, comb_p,
             res_cur, epoch, scratch)
     pl = [t.data_ptr() for t in ptrs] + [peers.addresses.data_ptr(), rank]
+    sly = wsort.layout(m)
+    sbuf = torch.empty(sly["nbytes"], device=dev, dtype=torch.uint8)
+    wsort.init(sbuf, m)
+    moe_out = torch.full((m, HIDDEN), 7.0, device=dev, dtype=torch.bfloat16)
 
-    def go():
-        launch(*pl, *ints, stream=torch.cuda.current_stream())
+    def go(mt=m):
+        launch(*pl, *ints, sbuf.data_ptr(), moe_out.data_ptr(), mt,
+               stream=torch.cuda.current_stream())
 
     dist.barrier(cpu)
     go()
@@ -200,6 +206,15 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             errs["route_ranks"] = max(
                 float((t != ids).any()) for t in gather(ids)
             ) + max(float((t != wts).any()) for t in gather(wts))
+        if a.sort:
+            bad = sort_check(sbuf, sly, ids, wts, m, m, moe_out)
+            # fewer tokens than the bucket, then back: the previous launch's rows reset
+            for mt in (max(tt, m - tt), max(1, m // 2 - 1), m):
+                moe_out.fill_(7.0)
+                go(mt)
+                torch.cuda.synchronize()
+                bad += sort_check(sbuf, sly, ids, wts, m, mt, moe_out)
+            errs["sort_bad"] = bad
     # repeated launches: the epoch hand-offs, across ranks
     for _ in range(a.launches):
         go()
@@ -227,7 +242,7 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
             acc = tr if acc is None else acc + tr
         tr = acc / 20
         names = ["start", "aseam", "agate", "inproj", "kda", "oproj", "reduce", "fseam",
-                 "fgate", "epoch", "router", "route", "rwait"]
+                 "fgate", "epoch", "router", "route", "rwait", "sort"]
         for p_, nm in sorted(enumerate(names), key=lambda x: {9: 99, 12: 10.5}.get(x[0], x[0])):
             col = tr[:, p_]
             col = col[(col > -1e5) & (col < 1e5)]
@@ -236,8 +251,43 @@ def run(a, reqs, sbf, rank, tp, dev, cpu):
     peers.close()
     tol = {"R_in": 1e-6, "rin_ranks": 0.0, "x_a": 1e-3, "post_a": 1e-5, "comb_a": 1e-5, "core": 1e-6, "proj": 1e-2, "o": 1e-2, "o_ranks": 0.0, "R_mid": 1e-6, "x_f": 1e-3,
            "post_f": 1e-5, "comb_f": 1e-5, "xf_ranks": 0.0, "ids_bad": 0, "w": 1e-5, "logits": 1e-5,
-           "shared": 0, "route_ranks": 0.0}
+           "shared": 0, "route_ranks": 0.0, "sort_bad": 0}
     return all(errs[k] <= v for k, v in tol.items() if k in errs)
+
+
+def sort_check(sbuf, ly, ids, wts, b, mt, moe_out):
+    """Mismatches of the launch's sort of tokens 0 .. mt-1 against AITER's BM16 aux sort
+    layout built here (an expert's pairs by token, pad b), and of the zeroed output."""
+    v = {k: t.cpu() for k, t in wsort.views(sbuf, ly, mt).items()}
+    ids_c, w_c = ids[:mt].cpu().long(), wts[:mt].cpu()
+    e_ids, e_w, e_mi, e_eids = [], [], [], []
+    rev = torch.zeros(mt * MOE_SLOTS, dtype=torch.int32)
+    for e in range(wsort.E):
+        ts, ss = (ids_c == e).nonzero(as_tuple=True)
+        n = ts.numel()
+        if n == 0:
+            continue
+        nb = -(-n // wsort.BM)
+        for i in range(n):
+            t, sl = int(ts[i]), int(ss[i])
+            rev[t * MOE_SLOTS + sl] = len(e_ids)
+            e_ids.append((sl << 24) | t)
+            e_w.append(float(w_c[t, sl]))
+            e_mi.append(t)
+        for _ in range(nb * wsort.BM - n):
+            e_ids.append(b)
+            e_w.append(0.0)
+            e_mi.append(b)
+        e_eids += [e] * nb
+    nv = len(e_ids)
+    bad = int(v["num_valid_ids"][0] != nv) + int(v["num_valid_ids"][1] != mt)
+    bad += int((v["sorted_token_ids"][:nv] != torch.tensor(e_ids, dtype=torch.int32)).sum())
+    bad += int((v["sorted_weights"][:nv] != torch.tensor(e_w)).sum())
+    bad += int((v["m_indices"][:nv] != torch.tensor(e_mi, dtype=torch.int32)).sum())
+    bad += int((v["sorted_expert_ids"][: nv // wsort.BM] != torch.tensor(e_eids, dtype=torch.int32)).sum())
+    bad += int((v["reverse_sorted"] != rev).sum())
+    bad += int((moe_out != 0).any(1).sum())
+    return bad
 
 
 def route_check(x_f, w_r, bias_r, ids, wts):
@@ -269,6 +319,7 @@ def main():
     ap.add_argument("--oneshot-rows", type=int, default=0)
     ap.add_argument("--t1", action="store_true")
     ap.add_argument("--trace", action="store_true")
+    ap.add_argument("--sort", action="store_true")
     a = ap.parse_args()
     rank = int(os.environ["RANK"])
     tp = int(os.environ["WORLD_SIZE"])

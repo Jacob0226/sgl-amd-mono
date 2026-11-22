@@ -172,12 +172,13 @@ def route_row(tid, t, rows, ks, parts, bias, ids_out, w_out, logits, red, shared
         e, wt = _top8(lane, raws, bs)
         sh = lane == TOP_K
         ok = lane < MOE_SLOTS
+        # device-coherent: the launch's sort CTA reads them
         bo.buffer_store(
             sh.select(fx.Int32(SHARED_EXPERT), e), rsrc(ids_out, rows * MOE_SLOTS * 4),
-            t * MOE_SLOTS + lane, mask=ok,
+            t * MOE_SLOTS + lane, mask=ok, cache_modifier=CM_DEV,
         )
         bo.buffer_store(
             sh.select(fx.Float32(shared_w), wt), rsrc(w_out, rows * MOE_SLOTS * 4),
-            t * MOE_SLOTS + lane, mask=ok,
+            t * MOE_SLOTS + lane, mask=ok, cache_modifier=CM_DEV,
         )
     gpu.barrier()

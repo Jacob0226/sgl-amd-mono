@@ -37,7 +37,7 @@ from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, rsrc, uniform
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, first_task, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN, N_EXPERTS
-from sgl_amd_mono.glm53_flash.gfx950.wide import coll, kda, mhc, route, tile_dma
+from sgl_amd_mono.glm53_flash.gfx950.wide import coll, kda, mhc, route, sort, tile_dma
 from sgl_amd_mono.glm53_flash.gfx950.wide.m1a import (
     CNT_STRIDE,
     TRACE_POINTS,
@@ -91,6 +91,7 @@ def scratch_layout(rows, tt, trace=False):
     take("pmix_f", 2 * mhc.pmix_words(rows))
     take("cnt_r", CNT_STRIDE * route.n_tiles(gr) * -(-rows // gr.bm))
     take("parts", gr.ks * rows * N_EXPERTS)
+    take("sflag", rows)
     if trace:
         take("trace", BLOCKS * TRACE_POINTS * 2)
     offs["end"] = w
@@ -120,12 +121,12 @@ _BUILDS: dict = {}
 
 def build(
     rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop="route", trace=False,
-    shared_w=1.0, oneshot=False, t1=False,
+    shared_w=1.0, oneshot=False, t1=False, moe_sort=False,
 ):
     keyed = key_tuple(locals(), SOURCES)
     key = (
         rows, tt, tp, lower_bound, onorm_eps, state_bf16, has_iw, stop, trace, shared_w,
-        oneshot, t1,
+        oneshot, t1, moe_sort,
     )
     if key in _BUILDS:
         return _BUILDS[key]
@@ -180,12 +181,28 @@ def build(
     class KdaLds:
         f: fx.Array[fx.Float32, kda.lds_floats(tt), 16]
 
+    swl = sort.lds_words(rows)
+
+    @fx.struct
+    class SortLds:
+        masks: fx.Array[fx.Int32, swl["masks"], 16]
+        bbl: fx.Array[fx.Int32, swl["bbl"], 16]
+        scan: fx.Array[fx.Int32, swl["scan"], 16]
+
     @fx.union
     class Smem:
         mhc: MhcLds
         gemm: GemmLds
         gc: GemmC
         kda: KdaLds
+        srt: SortLds
+
+    sly = sort.layout(rows)
+    # the CTA the sort task lands on: first past the route rows (stage bases are static)
+    sort_cta = (
+        n_seam + rows + n_inproj + reqs * kda.NH + n_oproj + n_reduce + n_seam + rows
+        + n_router + rows + (n_tpush + n_treduce)
+    ) % BLOCKS
 
     I64, I32 = fx.Int64, fx.Int32
 
@@ -209,6 +226,7 @@ def build(
         epoch: I64, scratch: I64, peers: I64, rank: I32,
         cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32, iw_win: I32,
         rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32, ring_len: I32,
+        sbuf: I64, moe_out: I64, m_tok: I32,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -229,6 +247,9 @@ def build(
                 _stamp(tid, bid, scratch, sc["trace"], point)
 
         stamp(0)
+        if const_expr(moe_sort):
+            if bid == sort_cta:
+                sort.sort_reset(tid, sly, sbuf)
 
         def seam_ctx(pmix_name, args, store_x, x_done, **kw):
             pa = sreg(scratch, sc[pmix_name] * 4, pmix_name)
@@ -454,7 +475,24 @@ def build(
                 route.route_row(
                     tid, t, rows, gr.ks, parts, bias_r, ids, wts, logits, cl, shared_w
                 )
+                if const_expr(moe_sort):
+                    _flag(tid, scratch, sc["sflag"] + t, ep + 1)
             stamp(11)
+            if const_expr(moe_sort):
+                # ---- sort: one CTA past the route rows; the rest zero the experts' output
+                base += rows
+                assert base % BLOCKS == sort_cta, (base, sort_cta)
+                if first_task(bid, base) == 0:
+                    sl_ = lds.srt.peek()
+                    sort.sort_rows(
+                        tid, m_tok, sly, scratch, sc["sflag"], ep + 1, ids, wts, sbuf,
+                        sl_.masks.ptr, sl_.bbl.ptr, sl_.scan.ptr,
+                    )
+                base += 1
+                r_moe = rsrc(moe_out, rows * HIDDEN * 2)
+                for r in range(first_task(bid, base), rows, BLOCKS):
+                    bo.buffer_store(zero4, r_moe, r * (HIDDEN // 2) + tid * 4)
+                stamp(13)
         epoch_end(cb, epoch, ep)
         stamp(9)
 
@@ -474,6 +512,7 @@ def build(
         epoch: I64, scratch: I64, peers: I64, rank: I32,
         cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32, iw_win: I32,
         rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32, ring_len: I32,
+        sbuf: I64, moe_out: I64, m_tok: I32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         _ = keyed
@@ -485,7 +524,7 @@ def build(
             moe_in, post_p, comb_p, res_cur, epoch,
             scratch, peers, rank,
             cs_line, cs_tok, iw_line, iw_step, iw_win, rawv_slot, rawk_slot, g_slot,
-            beta_slot, ring_len,
+            beta_slot, ring_len, sbuf, moe_out, m_tok,
         ).launch(grid=(BLOCKS, 1, 1), block=(THREADS,), stream=stream)
 
     launch.plan = dict(
@@ -494,7 +533,7 @@ def build(
         n_router=n_router, scratch_words=sc["end"],
         epoch_words=EPOCH_MARKS + BLOCKS,
         peer_bytes=coll.peer_bytes(rows, rb_o, go.bn, tp, oneshot, t1), oneshot=oneshot,
-        t1=t1, n_tpush=n_tpush,
+        t1=t1, n_tpush=n_tpush, moe_sort=moe_sort, sort_layout=sly,
     )
     _BUILDS[key] = launch
     return launch

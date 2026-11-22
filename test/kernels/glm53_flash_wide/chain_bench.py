@@ -113,7 +113,7 @@ def run(a, reqs, rank, tp, dev, cpu):
                     ly["post_f"], ly["comb_f"], w_r, bias_r, ly["ids"], ly["wts"], ly["logits"],
                     prev["moe"], prev["post_f"], prev["comb_f"], ly["res_cur"], epoch, scratch)
             launch(*[t.data_ptr() for t in ptrs], peers.addresses.data_ptr(), rank, *ints,
-                   stream=stream())
+                   0, 0, m, stream=stream())
             torch.matmul(ly["x_f"], w_m.T, out=ly["moe"])
             prev = ly
 
