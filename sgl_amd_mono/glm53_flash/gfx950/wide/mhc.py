@@ -64,9 +64,9 @@ COMB0 = 16  # comb[i][j] on lane COMB0 + 4 i + j
 KS = KT + 4
 
 
-def lds_words(s):
+def lds_words(s, cap=96):
     """f32 LDS words the stages use: R' slice rows, the slice's fn, the reduce scratch."""
-    br = s // bands(s)
+    br = s // bands(s, cap)
     red = max(br * UNITS, -(-br // TILE) * WAVES * 2 * 64 * 4, WAVES * 2 * 64 * 4)
     return {"rl": br * KS, "fl": MIX * KS, "red": red}
 
@@ -100,13 +100,16 @@ VEC = 8  # columns a slice unit: one 16 B load of a bf16 row
 UNITS = KT // VEC  # units a row
 
 
-def bands(s):
-    """Row bands a slice is split into (tasks = SLICES * bands): 2 past 48 rows."""
-    return 2 if s > 48 and s % 2 == 0 else 1
+def bands(s, cap=96):
+    """Row bands a slice is split into (tasks = SLICES * bands): 2 past 48 rows, and
+    at most ``cap`` rows a band (a band's mix tiles are live across its K loop)."""
+    b = max(-(-s // cap), 2 if s > 48 else 1)
+    assert s % b == 0, s
+    return b
 
 
-def tasks(s):
-    return SLICES * bands(s)
+def tasks(s, cap=96):
+    return SLICES * bands(s, cap)
 
 
 def _ld_row8(ptr, elem, cm=0, nbytes=None):
@@ -199,7 +202,7 @@ def slice_task(c, task):
     columns 32 (task % SLICES) .. + 32 of the rows in band task // SLICES."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rl, fl = c["rl"], c["fl"]
-    br = s // bands(s)
+    br = c.get("BR", s // bands(s))
     c0 = (task % SLICES) * COLS
     tb = (task // SLICES) * br
     fn = _slice_fn_loads(c, c0)

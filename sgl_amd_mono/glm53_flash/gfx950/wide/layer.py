@@ -151,17 +151,19 @@ def build(
     n_pieces = coll.pieces(rows, rb_o, go.bn, tp)
     n_reduce = 0 if oneshot else n_pieces
     pf = coll.full_pieces(rows, rb_o, go.bn)
-    n_seam = mhc.tasks(rows)
+    # a body launch spills past 48-row bands; a seam launch keeps one round of tasks
+    band_cap = 48 if body else 96
+    n_seam = mhc.tasks(rows, band_cap)
     gr = route.rgate_cfg(rows)
     ntr, tmr = route.n_tiles(gr), -(-rows // gr.bm)
     n_router = ntr * gr.ks * tmr
-    br = rows // mhc.bands(rows)
+    br = rows // mhc.bands(rows, band_cap)
     nbw = (br - 1) // rb_o + 2  # AG bands a slice band can touch
     sc = scratch_layout(rows, tt, trace)
     poffs, half = coll.layout(rows, rb_o, go.bn, tp, oneshot, t1)
     n_tpush = -(-rows // rb_o) * (HIDDEN // go.bn) if t1 else 0
     n_treduce = n_pieces if t1 else 0
-    lw = mhc.lds_words(rows)
+    lw = mhc.lds_words(rows, band_cap)
     proj_words = rows * kda.NPROJ // 2
     zero_per = -(-proj_words // (n_seam * 4)) * 4
 
@@ -267,7 +269,7 @@ def build(
                 return [w[0].bitcast(fx.Float32) for w in got]
 
             return dict(
-                S=rows, tid=tid, lane=tid % 64, wave=tid // 64,
+                S=rows, BR=br, tid=tid, lane=tid % 64, wave=tid // 64,
                 rl=ml.rl.ptr, fl=ml.fl.ptr, red=ml.red.ptr, args=dict(args, pmix=None),
                 put=put, getn=getn, store_x=store_x, x_done=x_done, cm=CM_DEV, **kw,
             )
