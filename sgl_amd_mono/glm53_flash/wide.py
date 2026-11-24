@@ -52,6 +52,18 @@ def _say(msg):
         print(f"[glm53 wide] {msg}", flush=True)
 
 
+def moe_output_flag() -> bool:
+    """Whether SGLang's aiter MoE runner writes a caller's buffer (forward flag
+    ``aiter_moe_output``); without it the experts' output is copied into the launch's."""
+    from sglang.srt.runtime_context import get_forward
+
+    try:
+        with get_forward().scoped(aiter_moe_output=None):
+            return True
+    except ValueError:
+        return False
+
+
 def is_covered(layer) -> bool:
     """A KDA layer with the routed MoE: the wide launch's layer."""
     from sglang.srt.models.glm5_next import Glm5NextMoE
@@ -188,6 +200,7 @@ class Wide:
         self.buckets = tuple(L * r for r in req_buckets() if L * r > NARROW)
         self.bufs, self.runs = {}, {}
         self.kda_ready = False
+        self.moe_out = moe_output_flag()
         runs, cur = [], []
         for i in range(bb.start_layer, bb.end_layer):
             if i in self.layers or i in self.dsa:
@@ -200,7 +213,8 @@ class Wide:
         _say(
             f"{len(idx)} covered layers and {len(didx)} DSA layers' seams in {len(runs)} runs "
             f"({', '.join(f'{r[0]}..{r[-1]}' for r in runs)}), {L} tokens a request, "
-            f"buckets {self.buckets}, state {'bf16' if state_bf16 else 'f32'}"
+            f"buckets {self.buckets}, state {'bf16' if state_bf16 else 'f32'}, experts "
+            f"{'write the launch buffer' if self.moe_out else 'output copied (no aiter_moe_output flag)'}"
         )
 
     # ------------------------------------------------------------ per bucket
@@ -416,7 +430,8 @@ class Wide:
         """SGLang's routed experts (the fused shared expert at slot 8) on the
         launch's FFN input and (ids, weights): this rank's partial -> cur["moe"], which
         aiter writes directly (``aiter_moe_output``), from the launch's sort and zeroing
-        (``register_presorted_moe``): only the two GEMMs run."""
+        (``register_presorted_moe``): only the two GEMMs run. Without the flag aiter
+        zeroes its own output and the partial is copied in."""
         from aiter.presorted_moe import register_presorted_moe
         from sglang.srt.layers.moe.topk import build_precomputed_topk_output
         from sglang.srt.runtime_context import get_forward
@@ -437,7 +452,10 @@ class Wide:
                 moe_buf_zeroed=True, moe_buf_ptr=out.data_ptr(),
             )
         )
-        with get_forward().scoped(aiter_moe_output=out):
+        if self.moe_out:
+            with get_forward().scoped(aiter_moe_output=out):
+                y = moe.experts(cur["x_f"][:rows], topk)
+        else:
             y = moe.experts(cur["x_f"][:rows], topk)
         if y.data_ptr() != out.data_ptr():
             out.copy_(y)
