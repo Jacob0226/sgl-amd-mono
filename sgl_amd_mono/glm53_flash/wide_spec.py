@@ -33,6 +33,25 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.glm53_flash import HF_CONFIG, LINEAR_ATTN_CONFIG, wide
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
+        "DeviceLimits",
+        "Feature",
+        "MonoSpec",
+        "Numerics",
+        "NumericsKind",
+        "Requirements",
+    ),
+    "srt/arg_groups/fields/*.py": (
+        "speculative_eagle_topk",
+        "speculative_num_steps",
+        "speculative_num_draft_tokens",
+    ),
+    "srt/configs/mamba_utils.py": ("mamba2_state_dtype",),
+    "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
+    "srt/runtime_context.py": ("get_parallel", "get_spec"),
+}
 NUMERICS = Numerics(NumericsKind.TOLERANCE, {"kda.streams.cosine": 0.95})
 
 

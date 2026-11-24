@@ -30,6 +30,40 @@ HC = HF_CONFIG["hc_mult"]
 HIDDEN = HF_CONFIG["hidden_size"]
 TOPK_SLOTS = HF_CONFIG["num_experts_per_tok"] + HF_CONFIG["n_shared_experts"]
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "kernels/ops/layernorm/mhc.py": ("hc_contract",),
+    "srt/distributed/communication_op.py": ("tensor_model_parallel_all_reduce",),
+    "srt/environ.py": (
+        "envs",
+        "SGLANG_SIMULATE_UNIFORM_EXPERTS",
+        "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
+    ),
+    "srt/layers/attention/linear/utils.py": (
+        "select_verify_intermediate_state_indices",
+    ),
+    "srt/layers/layer_boundary/adapters/attention.py": (
+        "AttentionInputs",
+        "get_attn_tp_context",
+    ),
+    "srt/layers/layer_boundary/residual/batch.py": (
+        "start",
+        "stream_of",
+        "set_written",
+        "complete_output",
+        "final_norm",
+    ),
+    "srt/layers/moe/topk.py": (
+        "TopKOutputFormat",
+        "build_precomputed_topk_output",
+        "is_expert_remapping_enabled",
+    ),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/models/glm5_next.py": ("Glm5NextMoE",),
+    "srt/runtime_context.py": ("get_forward",),
+    "srt/utils/common.py": ("BumpAllocator",),
+}
+
 
 def widths(L: int) -> tuple:
     """The rows a wide step takes: every request count up to the largest bucket."""
@@ -644,7 +678,13 @@ class Wide:
         launch: the final norm's rows."""
         from sglang.kernels.ops.layernorm.mhc import hc_contract
         from sglang.srt.distributed import tensor_model_parallel_all_reduce
-        from sglang.srt.layers.layer_boundary.residual import batch as rb
+        from sglang.srt.layers.layer_boundary.residual.batch import (
+            complete_output,
+            final_norm,
+            set_written,
+            start,
+            stream_of,
+        )
         from sglang.srt.utils.common import BumpAllocator
 
         m = self.bb
@@ -658,7 +698,7 @@ class Wide:
         if not getattr(self, "_said", False):
             self._said = True
             _say(f"first wide step: rows {rows} (bucket {b})")
-        rb.start(fb)
+        start(fb)
         dev = hidden.device
         zero_allocator = BumpAllocator(
             buffer_size=2 * (m.end_layer - m.start_layer),
@@ -691,7 +731,7 @@ class Wide:
                 continue
             # a run of covered layers, from the written streams (the first launch reads
             # SGLang's rows in place; the bucket's pad rows read 0)
-            if rb.stream_of(fb).pending is not None:
+            if stream_of(fb).pending is not None:
                 raise RuntimeError(
                     f"wide run at layer {i}: a residual update is still pending"
                 )
@@ -753,7 +793,7 @@ class Wide:
             )
             if run[-1] == self.last:
                 hidden = hc_contract(hidden, HC)
-            hidden = rb.set_written(hidden, fb)
+            hidden = set_written(hidden, fb)
             topk_indices = None
-        hidden = rb.complete_output(hidden, fb)
-        return rb.final_norm(hidden, fb, m.norm)
+        hidden = complete_output(hidden, fb)
+        return final_norm(hidden, fb, m.norm)
