@@ -28,7 +28,12 @@ sys.path.insert(0, HERE)
 from layer_bench import gather, rel  # noqa: E402
 
 from sgl_amd_mono.common.peer import PeerBuffer  # noqa: E402
-from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN, MOE_SLOTS, N_EXPERTS, TOP_K  # noqa: E402
+from sgl_amd_mono.glm53_flash.gfx950.config import (  # noqa: E402
+    HIDDEN,
+    MOE_SLOTS,
+    N_EXPERTS,
+    TOP_K,
+)
 from sgl_amd_mono.glm53_flash.gfx950.wide import kda, layer, mhc  # noqa: E402
 
 HC = mhc.HC
@@ -51,9 +56,15 @@ def run(a, reqs, rank, tp, dev, cpu):
         return torch.zeros(*s, device=dev, dtype=dt)
 
     # one set of weights for every layer (replicated, then this rank's)
-    mw = [dict(fn=rnd(24, HC * HIDDEN, scale=0.02), scale=torch.tensor([0.8, 0.6, 1.1], device=dev),
-               base=rnd(24, scale=0.3), norm=(1 + rnd(HIDDEN, scale=0.1)).to(torch.bfloat16))
-          for _ in range(2)]
+    mw = [
+        dict(
+            fn=rnd(24, HC * HIDDEN, scale=0.02),
+            scale=torch.tensor([0.8, 0.6, 1.1], device=dev),
+            base=rnd(24, scale=0.3),
+            norm=(1 + rnd(HIDDEN, scale=0.1)).to(torch.bfloat16),
+        )
+        for _ in range(2)
+    ]
     w_r = rnd(N_EXPERTS, HIDDEN, scale=0.02, dt=torch.bfloat16)
     bias_r = rnd(N_EXPERTS, scale=0.5)
     w_in = rnd(NPROJ, HIDDEN, scale=0.02, dt=torch.bfloat16, g=lg)
@@ -70,20 +81,35 @@ def run(a, reqs, rank, tp, dev, cpu):
     # per layer: its own KDA cache and outputs; layer 0's inputs are the step's
     layers = []
     for _ in range(a.layers):
-        conv_st = rnd(slots, 3, 3 * P, scale=0.5, dt=torch.bfloat16, g=lg).transpose(1, 2)
-        layers.append(dict(
-            conv_st=conv_st,
-            state=rnd(slots, NH, KD, KD, scale=0.05, dt=torch.bfloat16, g=lg),
-            rawv=z(slots, NH, L, KD, dt=torch.bfloat16), rawk=z(slots, NH, L, KD, dt=torch.bfloat16),
-            ring_g=z(slots, NH, L, KD), ring_beta=z(slots, NH, L),
-            iw=z(slots, tt, 3, 3 * P, dt=torch.bfloat16).transpose(2, 3),
-            core=z(m, P, dt=torch.bfloat16), x_a=z(m, HIDDEN, dt=torch.bfloat16),
-            post_a=z(m, HC), comb_a=z(m, HC * HC), proj=z(m, NPROJ, dt=torch.bfloat16),
-            acc_o=z(m, HIDDEN, dt=torch.bfloat16), res_mid=z(m, HC, HIDDEN, dt=torch.bfloat16),
-            x_f=z(m, HIDDEN, dt=torch.bfloat16), post_f=z(m, HC), comb_f=z(m, HC * HC),
-            ids=z(m, MOE_SLOTS, dt=torch.int32), wts=z(m, MOE_SLOTS), logits=z(m, N_EXPERTS),
-            moe=z(m, HIDDEN, dt=torch.bfloat16), res_cur=z(m, HC, HIDDEN, dt=torch.bfloat16),
-        ))
+        conv_st = rnd(slots, 3, 3 * P, scale=0.5, dt=torch.bfloat16, g=lg).transpose(
+            1, 2
+        )
+        layers.append(
+            dict(
+                conv_st=conv_st,
+                state=rnd(slots, NH, KD, KD, scale=0.05, dt=torch.bfloat16, g=lg),
+                rawv=z(slots, NH, L, KD, dt=torch.bfloat16),
+                rawk=z(slots, NH, L, KD, dt=torch.bfloat16),
+                ring_g=z(slots, NH, L, KD),
+                ring_beta=z(slots, NH, L),
+                iw=z(slots, tt, 3, 3 * P, dt=torch.bfloat16).transpose(2, 3),
+                core=z(m, P, dt=torch.bfloat16),
+                x_a=z(m, HIDDEN, dt=torch.bfloat16),
+                post_a=z(m, HC),
+                comb_a=z(m, HC * HC),
+                proj=z(m, NPROJ, dt=torch.bfloat16),
+                acc_o=z(m, HIDDEN, dt=torch.bfloat16),
+                res_mid=z(m, HC, HIDDEN, dt=torch.bfloat16),
+                x_f=z(m, HIDDEN, dt=torch.bfloat16),
+                post_f=z(m, HC),
+                comb_f=z(m, HC * HC),
+                ids=z(m, MOE_SLOTS, dt=torch.int32),
+                wts=z(m, MOE_SLOTS),
+                logits=z(m, N_EXPERTS),
+                moe=z(m, HIDDEN, dt=torch.bfloat16),
+                res_cur=z(m, HC, HIDDEN, dt=torch.bfloat16),
+            )
+        )
     r0 = rnd(m, HC, HIDDEN, dt=torch.bfloat16)
     p0 = torch.rand(m, HC, device=dev, generator=gen) * 2
     c0 = torch.rand(m, HC * HC, device=dev, generator=gen) / 2
@@ -102,30 +128,95 @@ def run(a, reqs, rank, tp, dev, cpu):
         prev = dict(res_mid=r0, post_f=p0, comb_f=c0, moe=m0)
         for ly in layers:
             iw_s = ly["iw"].stride()
-            ints = (ly["conv_st"].stride(0), ly["conv_st"].stride(2), iw_s[0], iw_s[1], iw_s[3],
-                    ly["rawv"].stride(0), ly["rawk"].stride(0), ly["ring_g"].stride(0),
-                    ly["ring_beta"].stride(0), L)
-            ptrs = (prev["res_mid"], fa["fn"], fa["scale"], fa["base"], fa["norm"], ly["x_a"],
-                    ly["post_a"], ly["comb_a"], w_in, ly["proj"], conv_w, ly["conv_st"], idx,
-                    ly["iw"], idx, w_fgb, a_log, dt_bias, ly["state"], idx, ly["rawv"], ly["rawk"],
-                    ly["ring_g"], ly["ring_beta"], idx, on_w, ly["core"], w_o, ly["acc_o"],
-                    ff["fn"], ff["scale"], ff["base"], ff["norm"], ly["res_mid"], ly["x_f"],
-                    ly["post_f"], ly["comb_f"], w_r, bias_r, ly["ids"], ly["wts"], ly["logits"],
-                    prev["moe"], prev["post_f"], prev["comb_f"], ly["res_cur"], epoch, scratch)
-            launch(*[t.data_ptr() for t in ptrs], peers.addresses.data_ptr(), rank, *ints,
-                   0, 0, m, stream=stream())
+            ints = (
+                ly["conv_st"].stride(0),
+                ly["conv_st"].stride(2),
+                iw_s[0],
+                iw_s[1],
+                iw_s[3],
+                ly["rawv"].stride(0),
+                ly["rawk"].stride(0),
+                ly["ring_g"].stride(0),
+                ly["ring_beta"].stride(0),
+                L,
+            )
+            ptrs = (
+                prev["res_mid"],
+                fa["fn"],
+                fa["scale"],
+                fa["base"],
+                fa["norm"],
+                ly["x_a"],
+                ly["post_a"],
+                ly["comb_a"],
+                w_in,
+                ly["proj"],
+                conv_w,
+                ly["conv_st"],
+                idx,
+                ly["iw"],
+                idx,
+                w_fgb,
+                a_log,
+                dt_bias,
+                ly["state"],
+                idx,
+                ly["rawv"],
+                ly["rawk"],
+                ly["ring_g"],
+                ly["ring_beta"],
+                idx,
+                on_w,
+                ly["core"],
+                w_o,
+                ly["acc_o"],
+                ff["fn"],
+                ff["scale"],
+                ff["base"],
+                ff["norm"],
+                ly["res_mid"],
+                ly["x_f"],
+                ly["post_f"],
+                ly["comb_f"],
+                w_r,
+                bias_r,
+                ly["ids"],
+                ly["wts"],
+                ly["logits"],
+                prev["moe"],
+                prev["post_f"],
+                prev["comb_f"],
+                ly["res_cur"],
+                epoch,
+                scratch,
+            )
+            launch(
+                *[t.data_ptr() for t in ptrs],
+                peers.addresses.data_ptr(),
+                rank,
+                *ints,
+                0,
+                0,
+                m,
+                stream=stream(),
+            )
             torch.matmul(ly["x_f"], w_m.T, out=ly["moe"])
             prev = ly
 
     def snap():
         last = layers[-1]
-        return {k: last[k].clone() for k in ("res_mid", "x_f", "ids", "wts", "post_f", "comb_f")}
+        return {
+            k: last[k].clone()
+            for k in ("res_mid", "x_f", "ids", "wts", "post_f", "comb_f")
+        }
 
     def key_set_bad(ids_a, ids_b, logits, bias):
         keys = torch.sigmoid(logits) + bias.to(torch.bfloat16).float()
         kv = keys.topk(TOP_K + 1, dim=1).values
         tie = (kv[:, TOP_K - 1] - kv[:, TOP_K]) < 2e-2
-        same = (ids_a[:, :TOP_K].sort(1).values == ids_b[:, :TOP_K].sort(1).values).all(1)
+        same = (ids_a[:, :TOP_K].sort(1).values == ids_b[:, :TOP_K].sort(1).values).all(
+            1
+        )
         return int((~same & ~tie).sum().item())
 
     errs = {}
@@ -133,7 +224,9 @@ def run(a, reqs, rank, tp, dev, cpu):
     step()
     torch.cuda.synchronize()
     ref = snap()
-    errs["ranks_eager"] = max(max(float((t != v).any()) for t in gather(v)) for v in ref.values())
+    errs["ranks_eager"] = max(
+        max(float((t != v).any()) for t in gather(v)) for v in ref.values()
+    )
     # the graph: the whole chain, captured once (the epoch moves on in device memory)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
@@ -151,17 +244,25 @@ def run(a, reqs, rank, tp, dev, cpu):
         out = snap()
         for k in ("res_mid", "x_f", "post_f", "comb_f"):
             worst[k] = max(worst.get(k, 0.0), rel(out[k], ref[k]))
-        worst["ids_bad"] = max(worst.get("ids_bad", 0), key_set_bad(
-            out["ids"], ref["ids"], layers[-1]["logits"], bias_r))
-        worst["ranks"] = max(worst.get("ranks", 0.0), max(
-            max(float((t != v).any()) for t in gather(v)) for v in out.values()))
+        worst["ids_bad"] = max(
+            worst.get("ids_bad", 0),
+            key_set_bad(out["ids"], ref["ids"], layers[-1]["logits"], bias_r),
+        )
+        worst["ranks"] = max(
+            worst.get("ranks", 0.0),
+            max(max(float((t != v).any()) for t in gather(v)) for v in out.values()),
+        )
     errs.update(worst)
     errs["ep"] = epoch[0].item()
     line = f"rank {rank} reqs {reqs:2d} rows {m:3d} layers {a.layers} " + "  ".join(
-        f"{k} {v:.1e}" if isinstance(v, float) else f"{k} {v}" for k, v in errs.items())
+        f"{k} {v:.1e}" if isinstance(v, float) else f"{k} {v}" for k, v in errs.items()
+    )
     if a.time:
         torch.cuda.synchronize()
-        st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        st, en = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
         st.record()
         for _ in range(10):
             g.replay()
@@ -183,8 +284,15 @@ def run(a, reqs, rank, tp, dev, cpu):
         line += f"  step {step_us:7.1f} us  stand-in MoE {moe_us:6.1f} us  per layer {(step_us - moe_us) / a.layers:6.1f} us"
     print(line, flush=True)
     peers.close()
-    tol = {"ranks_eager": 0.0, "ranks": 0.0, "res_mid": 2e-2, "x_f": 2e-2, "post_f": 2e-2,
-           "comb_f": 2e-2, "ids_bad": 0}
+    tol = {
+        "ranks_eager": 0.0,
+        "ranks": 0.0,
+        "res_mid": 2e-2,
+        "x_f": 2e-2,
+        "post_f": 2e-2,
+        "comb_f": 2e-2,
+        "ids_bad": 0,
+    }
     bad = [k for k, v in tol.items() if errs[k] > v]
     if bad and rank == 0:
         print("  over tolerance:", bad, flush=True)

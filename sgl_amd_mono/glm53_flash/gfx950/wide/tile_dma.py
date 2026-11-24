@@ -19,7 +19,7 @@ out through ``emit`` / ``lin`` as in ``kimi_k31.gfx950.stages.tile_mma``.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Int64
 
 from sgl_amd_mono.common.ops import CM_NT, mfma_bf16, rsrc, uniform
@@ -148,12 +148,22 @@ def dma_tile(
     def compute(s):
         for kk in range_constexpr(bk // 32):
             a = [
-                _frag(ab, s * sw + xw, wx * tn + b * 16 + lane % 16, kk * 4 + lane // 16, pieces)
+                _frag(
+                    ab,
+                    s * sw + xw,
+                    wx * tn + b * 16 + lane % 16,
+                    kk * 4 + lane // 16,
+                    pieces,
+                )
                 for b in range(nt)
             ]
             for t in range_constexpr(mt):
                 xb = _frag(
-                    ab, s * sw, wy * tm + t * 16 + lane % 16, kk * 4 + lane // 16, pieces
+                    ab,
+                    s * sw,
+                    wy * tm + t * 16 + lane % 16,
+                    kk * 4 + lane // 16,
+                    pieces,
                 ).bitcast(fx.BFloat16)
                 for b in range_constexpr(nt):
                     acc[t][b] = mfma_bf16(a[b].bitcast(fx.BFloat16), xb, acc[t][b])
@@ -242,8 +252,27 @@ def standalone(
             emit = None
             lin = atomic_lin(out, n, n0, m, n, mode == "linbf")
         dma_tile(
-            tid, x, k, m, m0, w, k, n, n0, sk * kt, kt,
-            bm, bn, wm, wn, ab, emit, bk, stages, lin, cl,
+            tid,
+            x,
+            k,
+            m,
+            m0,
+            w,
+            k,
+            n,
+            n0,
+            sk * kt,
+            kt,
+            bm,
+            bn,
+            wm,
+            wn,
+            ab,
+            emit,
+            bk,
+            stages,
+            lin,
+            cl,
         )
 
     @flyc.jit

@@ -143,12 +143,18 @@ def reduce_bcast(c, piece, m, rb, bn, tp):
                 cur = [v for e in range(4) for v in bf2_f32(got[src][e])]
                 acc = cur if acc is None else [a + b for a, b in zip(acc, cur)]
             words = fx.Vector.from_elements(
-                [bf16_pair(acc[2 * j], acc[2 * j + 1]).bitcast(fx.Int32) for j in range(4)],
+                [
+                    bf16_pair(acc[2 * j], acc[2 * j + 1]).bitcast(fx.Int32)
+                    for j in range(4)
+                ],
                 fx.Int32,
             )
             for p in range_constexpr(tp):
                 bo.buffer_store(
-                    words, dsts[p], (row * HIDDEN + own * sl + col) // 2, cache_modifier=CM_SYS
+                    words,
+                    dsts[p],
+                    (row * HIDDEN + own * sl + col) // 2,
+                    cache_modifier=CM_SYS,
                 )
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
@@ -171,7 +177,10 @@ def push_all(c, acc, m, row0, rb, n0, bn, tp, piece):
         col = n0 + 8 * (u % q8)
         w = fx.Vector(
             bo.buffer_load(
-                r, (fx.min(row, m - 1) * HIDDEN + col) // 2, vec_width=4, dtype=T.i32,
+                r,
+                (fx.min(row, m - 1) * HIDDEN + col) // 2,
+                vec_width=4,
+                dtype=T.i32,
                 cache_modifier=CM_DEV,
             )
         )
@@ -180,11 +189,15 @@ def push_all(c, acc, m, row0, rb, n0, bn, tp, piece):
         if (row < m) & live:
             for p in range_constexpr(tp):
                 bo.buffer_store(
-                    w, dsts[p], ((c["rank"] * m + row) * HIDDEN + col) // 2,
+                    w,
+                    dsts[p],
+                    ((c["rank"] * m + row) * HIDDEN + col) // 2,
                     cache_modifier=CM_SYS,
                 )
             bo.buffer_store(
-                fx.Vector.filled(4, 0, fx.Int32), r, (row * HIDDEN + col) // 2,
+                fx.Vector.filled(4, 0, fx.Int32),
+                r,
+                (row * HIDDEN + col) // 2,
                 cache_modifier=CM_DEV,
             )
     rocdl.s_waitcnt(vmcnt=0)

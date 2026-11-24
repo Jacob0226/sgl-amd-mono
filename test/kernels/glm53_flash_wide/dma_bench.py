@@ -17,7 +17,9 @@ import torch
 os.environ.setdefault("SGLANG_USE_AITER", "1")
 sys.path.insert(
     0,
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kimi_k31"),
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kimi_k31"
+    ),
 )
 
 from tile_bench import bench  # noqa: E402
@@ -39,7 +41,9 @@ def main():
     ap.add_argument("--m", default="18,36,96")
     ap.add_argument("--shapes", default=SHAPES)
     ap.add_argument("--cfg", default=CFG)
-    ap.add_argument("--mode", default="linbf", help="part,atom,atombf,lin,linbf (ks > 1)")
+    ap.add_argument(
+        "--mode", default="linbf", help="part,atom,atombf,lin,linbf (ks > 1)"
+    )
     a = ap.parse_args()
     if a.time:
         from aiter.tuned_gemm import tgemm
@@ -58,7 +62,9 @@ def main():
             if a.time:
                 ut = bench(lambda w: tgemm.mm(x, w, None, otype=torch.bfloat16), ws)
                 tg = f"  tgemm {ut:6.1f} us"
-            for cfg, mode in ((c, md) for c in a.cfg.split(",") for md in a.mode.split(",")):
+            for cfg, mode in (
+                (c, md) for c in a.cfg.split(",") for md in a.mode.split(",")
+            ):
                 bm, bn, wm, wn, ks, bk, stages = map(int, cfg.split(":"))
                 if ks == 1 and mode != a.mode.split(",")[0]:
                     continue
@@ -94,7 +100,10 @@ def main():
                     fn(ws[0])
                     torch.cuda.synchronize()
                 except Exception as e:  # noqa: BLE001
-                    print(f"m={m} n={n} k={k} {cfg} {mode}: {type(e).__name__}: {e}", flush=True)
+                    print(
+                        f"m={m} n={n} k={k} {cfg} {mode}: {type(e).__name__}: {e}",
+                        flush=True,
+                    )
                     continue
                 got = out.sum(0) if part else out.float()
                 err = ((got - ref).norm() / ref.norm()).item()

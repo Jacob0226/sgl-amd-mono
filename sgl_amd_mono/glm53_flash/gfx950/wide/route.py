@@ -67,7 +67,11 @@ def part_emit(parts, rows, sk, n0):
     def emit(row, col, v, live):
         ok = (row < rows) & (n0 + col < N_EXPERTS)
         bo.buffer_store(
-            v, r_o, sk * plane + row * N_EXPERTS + n0 + col, mask=ok, cache_modifier=CM_DEV
+            v,
+            r_o,
+            sk * plane + row * N_EXPERTS + n0 + col,
+            mask=ok,
+            cache_modifier=CM_DEV,
         )
 
     return emit
@@ -134,8 +138,11 @@ def route_row(tid, t, rows, ks, parts, bias, ids_out, w_out, logits, red, shared
         [
             fx.Float32(
                 bo.buffer_load(
-                    r_p, (wave + j * WAVES) * plane + t * N_EXPERTS + cand[i],
-                    vec_width=1, dtype=T.f32, cache_modifier=CM_DEV,
+                    r_p,
+                    (wave + j * WAVES) * plane + t * N_EXPERTS + cand[i],
+                    vec_width=1,
+                    dtype=T.f32,
+                    cache_modifier=CM_DEV,
                 )
             )
             for j in range(per)
@@ -166,7 +173,10 @@ def route_row(tid, t, rows, ks, parts, bias, ids_out, w_out, logits, red, shared
             for w in range_constexpr(1, WAVES):
                 logit = logit + fx.ptr_load(red + ((w * CAND + i) * 64 + lane))
             bo.buffer_store(
-                logit, r_l, t * N_EXPERTS + lane + 64 * i, mask=lane + 64 * i < N_EXPERTS
+                logit,
+                r_l,
+                t * N_EXPERTS + lane + 64 * i,
+                mask=lane + 64 * i < N_EXPERTS,
             )
             raws.append(hw_rcp(1.0 + hw_exp(-logit)))
         e, wt = _top8(lane, raws, bs)
@@ -174,11 +184,17 @@ def route_row(tid, t, rows, ks, parts, bias, ids_out, w_out, logits, red, shared
         ok = lane < MOE_SLOTS
         # device-coherent: the launch's sort CTA reads them
         bo.buffer_store(
-            sh.select(fx.Int32(SHARED_EXPERT), e), rsrc(ids_out, rows * MOE_SLOTS * 4),
-            t * MOE_SLOTS + lane, mask=ok, cache_modifier=CM_DEV,
+            sh.select(fx.Int32(SHARED_EXPERT), e),
+            rsrc(ids_out, rows * MOE_SLOTS * 4),
+            t * MOE_SLOTS + lane,
+            mask=ok,
+            cache_modifier=CM_DEV,
         )
         bo.buffer_store(
-            sh.select(fx.Float32(shared_w), wt), rsrc(w_out, rows * MOE_SLOTS * 4),
-            t * MOE_SLOTS + lane, mask=ok, cache_modifier=CM_DEV,
+            sh.select(fx.Float32(shared_w), wt),
+            rsrc(w_out, rows * MOE_SLOTS * 4),
+            t * MOE_SLOTS + lane,
+            mask=ok,
+            cache_modifier=CM_DEV,
         )
     gpu.barrier()

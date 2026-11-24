@@ -16,7 +16,9 @@ import torch
 os.environ.setdefault("SGLANG_USE_AITER", "1")
 sys.path.insert(
     0,
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kimi_k31"),
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kimi_k31"
+    ),
 )
 
 from tile_bench import bench  # noqa: E402
@@ -62,7 +64,11 @@ def main():
             m = reqs * tt
             slots = reqs + 2
             res_in = torch.randn(m, HC, HIDDEN, device=dev).to(torch.bfloat16)
-            conv_st = (torch.randn(slots, 3, 3 * P, device=dev) * 0.5).to(torch.bfloat16).transpose(1, 2)
+            conv_st = (
+                (torch.randn(slots, 3, 3 * P, device=dev) * 0.5)
+                .to(torch.bfloat16)
+                .transpose(1, 2)
+            )
             sdt = torch.bfloat16 if sbf else torch.float32
             state = (torch.randn(slots, NH, KD, KD, device=dev) * 0.05).to(sdt)
             perm = torch.randperm(slots - 1, device=dev)[:reqs].to(torch.int32) + 1
@@ -74,11 +80,17 @@ def main():
 
             def bufs():
                 return dict(
-                    rawv=torch.zeros(slots, NH, L, KD, device=dev, dtype=torch.bfloat16),
-                    rawk=torch.zeros(slots, NH, L, KD, device=dev, dtype=torch.bfloat16),
+                    rawv=torch.zeros(
+                        slots, NH, L, KD, device=dev, dtype=torch.bfloat16
+                    ),
+                    rawk=torch.zeros(
+                        slots, NH, L, KD, device=dev, dtype=torch.bfloat16
+                    ),
                     ring_g=torch.zeros(slots, NH, L, KD, device=dev),
                     ring_beta=torch.zeros(slots, NH, L, device=dev),
-                    iw=torch.zeros(slots, tt, 3, 3 * P, device=dev, dtype=torch.bfloat16).transpose(2, 3),
+                    iw=torch.zeros(
+                        slots, tt, 3, 3 * P, device=dev, dtype=torch.bfloat16
+                    ).transpose(2, 3),
                     core=torch.zeros(m, P, device=dev, dtype=torch.bfloat16),
                 )
 
@@ -92,13 +104,49 @@ def main():
             epoch = torch.zeros(plan["epoch_words"], device=dev, dtype=torch.int32)
             scratch = torch.zeros(plan["scratch_words"], device=dev, dtype=torch.int32)
             iw_s = mine["iw"].stride()
-            ptrs = (res_in, fn, hc_scale, hc_base, norm_w, x, post_out, comb_out, w_in, proj,
-                    conv_w, conv_st, cs_idx, mine["iw"], iw_idx, w_fgb, a_log, dt_bias, state,
-                    h0_idx, mine["rawv"], mine["rawk"], mine["ring_g"], mine["ring_beta"],
-                    ring_idx, on_w, mine["core"], epoch, scratch)
-            ints = (conv_st.stride(0), conv_st.stride(2), iw_s[0], iw_s[1], iw_s[3],
-                    mine["rawv"].stride(0), mine["rawk"].stride(0), mine["ring_g"].stride(0),
-                    mine["ring_beta"].stride(0), L)
+            ptrs = (
+                res_in,
+                fn,
+                hc_scale,
+                hc_base,
+                norm_w,
+                x,
+                post_out,
+                comb_out,
+                w_in,
+                proj,
+                conv_w,
+                conv_st,
+                cs_idx,
+                mine["iw"],
+                iw_idx,
+                w_fgb,
+                a_log,
+                dt_bias,
+                state,
+                h0_idx,
+                mine["rawv"],
+                mine["rawk"],
+                mine["ring_g"],
+                mine["ring_beta"],
+                ring_idx,
+                on_w,
+                mine["core"],
+                epoch,
+                scratch,
+            )
+            ints = (
+                conv_st.stride(0),
+                conv_st.stride(2),
+                iw_s[0],
+                iw_s[1],
+                iw_s[3],
+                mine["rawv"].stride(0),
+                mine["rawk"].stride(0),
+                mine["ring_g"].stride(0),
+                mine["ring_beta"].stride(0),
+                L,
+            )
             pl = [t.data_ptr() for t in ptrs]
 
             def run():
@@ -111,14 +159,49 @@ def main():
             x_r = torch.zeros_like(x)
             post_r, comb_r = torch.zeros_like(post_out), torch.zeros_like(comb_out)
             dummy = torch.zeros(1, device=dev)
-            mhc.standalone(m, False)(*[t.data_ptr() for t in (
-                res_in, dummy, dummy, dummy, dummy, fn, hc_scale, hc_base, norm_w, pmix, x_r,
-                post_r, comb_r)], stream=torch.cuda.current_stream())
+            mhc.standalone(m, False)(
+                *[
+                    t.data_ptr()
+                    for t in (
+                        res_in,
+                        dummy,
+                        dummy,
+                        dummy,
+                        dummy,
+                        fn,
+                        hc_scale,
+                        hc_base,
+                        norm_w,
+                        pmix,
+                        x_r,
+                        post_r,
+                        comb_r,
+                    )
+                ],
+                stream=torch.cuda.current_stream(),
+            )
             proj_r = (x_r.float() @ w_in.float().T).to(torch.bfloat16)
             kl = kda.standalone(reqs, tt, LB, ONORM_EPS, bool(sbf), True)
-            kp = (proj, conv_w, conv_st, cs_idx, ref["iw"], iw_idx, w_fgb, a_log, dt_bias,
-                  state, h0_idx, ref["rawv"], ref["rawk"], ref["ring_g"], ref["ring_beta"],
-                  ring_idx, on_w, ref["core"])
+            kp = (
+                proj,
+                conv_w,
+                conv_st,
+                cs_idx,
+                ref["iw"],
+                iw_idx,
+                w_fgb,
+                a_log,
+                dt_bias,
+                state,
+                h0_idx,
+                ref["rawv"],
+                ref["rawk"],
+                ref["ring_g"],
+                ref["ring_beta"],
+                ring_idx,
+                on_w,
+                ref["core"],
+            )
             kl(*[t.data_ptr() for t in kp], *ints, stream=torch.cuda.current_stream())
             torch.cuda.synchronize()
             errs = {
@@ -145,23 +228,56 @@ def main():
             errs["drift_proj"] = dk["proj"]
             assert exact_mhc, "mHC outputs changed across launches"
             worst = max(worst, *errs.values())
-            line = (f"reqs {reqs:2d} rows {m:3d} ep {ep:3d}  "
-                    + "  ".join(f"{k} {v:.1e}" for k, v in errs.items()))
+            line = f"reqs {reqs:2d} rows {m:3d} ep {ep:3d}  " + "  ".join(
+                f"{k} {v:.1e}" for k, v in errs.items()
+            )
             if a.time:
                 t_m1a = bench(lambda _w: run(), [None] * 4)
                 g = plan["gemm"]
-                dl = tile_dma.standalone(m, NPROJ, HIDDEN, g.bm, g.bn, g.wm, g.wn, g.ks,
-                                         g.bk, g.stages, "linbf")
+                dl = tile_dma.standalone(
+                    m,
+                    NPROJ,
+                    HIDDEN,
+                    g.bm,
+                    g.bn,
+                    g.wm,
+                    g.wn,
+                    g.ks,
+                    g.bk,
+                    g.stages,
+                    "linbf",
+                )
                 pz = torch.zeros(m, NPROJ, device=dev, dtype=torch.bfloat16)
                 ml = mhc.standalone(m, False)
-                mp = [t.data_ptr() for t in (res_in, dummy, dummy, dummy, dummy, fn, hc_scale,
-                                             hc_base, norm_w, pmix, x_r, post_r, comb_r)]
+                mp = [
+                    t.data_ptr()
+                    for t in (
+                        res_in,
+                        dummy,
+                        dummy,
+                        dummy,
+                        dummy,
+                        fn,
+                        hc_scale,
+                        hc_base,
+                        norm_w,
+                        pmix,
+                        x_r,
+                        post_r,
+                        comb_r,
+                    )
+                ]
                 kpl = [t.data_ptr() for t in kp]
 
                 def chain():
                     ml(*mp, stream=torch.cuda.current_stream())
                     pz.zero_()
-                    dl(x_r.data_ptr(), w_in.data_ptr(), pz.data_ptr(), stream=torch.cuda.current_stream())
+                    dl(
+                        x_r.data_ptr(),
+                        w_in.data_ptr(),
+                        pz.data_ptr(),
+                        stream=torch.cuda.current_stream(),
+                    )
                     kl(*kpl, *ints, stream=torch.cuda.current_stream())
 
                 t_chain = bench(lambda _w: chain(), [None] * 4)

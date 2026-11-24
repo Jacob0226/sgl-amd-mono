@@ -5,9 +5,8 @@ read through the router's top-8 (and, past a run's first layer, the previous
 layer's MoE all-reduce and mHC write-back), SGLang's routed experts between
 launches, and SGLang's own path for the dense layers and each run's exit (the MoE
 all-reduce and ``hc_post``). A DSA + MoE layer joins the run as two seam launches
-around SGLang's DSA attention (``SGLANG_AMD_MONO_GLM53_WIDE_DSA``, on by default):
-the previous MoE's exit and the attention input, then the attention's all-reduce,
-the FFN input and its route.
+around SGLang's DSA attention: the previous MoE's exit and the attention input,
+then the attention's all-reduce, the FFN input and its route.
 
 The KDA stage is SGLang's ring verify (``enable_linear_replayssm_spec``): it reads
 the committed conv and recurrent state, writes every draft token's conv window and
@@ -16,8 +15,6 @@ the accepted ones.
 """
 
 from __future__ import annotations
-
-import os
 
 import torch
 
@@ -34,15 +31,9 @@ HIDDEN = HF_CONFIG["hidden_size"]
 TOPK_SLOTS = HF_CONFIG["num_experts_per_tok"] + HF_CONFIG["n_shared_experts"]
 
 
-def req_buckets() -> tuple:
-    # SGLANG_AMD_MONO_GLM53_WIDE_BUCKETS lists requests a bucket
-    env = os.environ.get("SGLANG_AMD_MONO_GLM53_WIDE_BUCKETS")
-    return tuple(sorted(int(x) for x in env.split(","))) if env else REQ_BUCKETS
-
-
 def widths(L: int) -> tuple:
     """The rows a wide step takes: every request count up to the largest bucket."""
-    return tuple(L * r for r in range(1, max(req_buckets()) + 1) if L * r > NARROW)
+    return tuple(L * r for r in range(1, max(REQ_BUCKETS) + 1) if L * r > NARROW)
 
 
 def _say(msg):
@@ -76,8 +67,7 @@ def is_dsa_covered(layer) -> bool:
     from sglang.srt.models.glm5_next import Glm5NextMoE
 
     return (
-        os.environ.get("SGLANG_AMD_MONO_GLM53_WIDE_DSA", "1") == "1"
-        and not layer.is_linear_attn
+        not layer.is_linear_attn
         and isinstance(layer.mlp, Glm5NextMoE)
         and moe_reason(layer.mlp) is None
     )
@@ -101,7 +91,8 @@ def moe_reason(moe) -> str | None:
             "output_format": cfg.output_format in (None, TopKOutputFormat.STANDARD),
             "sigmoid": cfg.scoring_func == "sigmoid",
             "bias": cfg.correction_bias is not None,
-            "ungrouped": (cfg.num_expert_group or 1) == 1 and (cfg.topk_group or 1) == 1,
+            "ungrouped": (cfg.num_expert_group or 1) == 1
+            and (cfg.topk_group or 1) == 1,
             "fused_shared": moe.num_fused_shared_experts == 1,
             "shared_weight": cfg.fused_shared_experts_scaling_factor in (None, 1.0),
             "no_eplb_remap": not is_expert_remapping_enabled(),
@@ -131,7 +122,9 @@ def _router(i, moe, copies):
 
 def _ffn_mhc(module):
     ffn = (
-        module.hc_ffn_fn, module.hc_ffn_scale, module.hc_ffn_base,
+        module.hc_ffn_fn,
+        module.hc_ffn_scale,
+        module.hc_ffn_base,
         module.post_attention_layernorm.weight,
     )
     assert all(t.dtype == torch.float32 for t in ffn[:3])
@@ -154,8 +147,17 @@ class _Layer:
         assert a.w_fb.data_ptr() == w_fgb.data_ptr() and w_fgb.is_contiguous()
         f32 = torch.float32
         self.ptr_a = (
-            a.hc_fn, a.hc_scale, a.hc_base, a.g_norm, a.w_in, a.conv_w, w_fgb,
-            a.a_log, a.dt_bias, a.w_on, a.w_o,
+            a.hc_fn,
+            a.hc_scale,
+            a.hc_base,
+            a.g_norm,
+            a.w_in,
+            a.conv_w,
+            w_fgb,
+            a.a_log,
+            a.dt_bias,
+            a.w_on,
+            a.w_o,
         )
         self.ffn = _ffn_mhc(module)
         self.w_r, self.bias = _router(i, self.moe, copies)
@@ -169,7 +171,9 @@ class _DsaLayer:
     def __init__(self, i, module, copies):
         self.i, self.module, self.moe = i, module, module.mlp
         attn = (
-            module.hc_attn_fn, module.hc_attn_scale, module.hc_attn_base,
+            module.hc_attn_fn,
+            module.hc_attn_scale,
+            module.hc_attn_base,
             module.input_layernorm.weight,
         )
         assert all(t.dtype == torch.float32 for t in attn[:3])
@@ -188,16 +192,22 @@ class Wide:
         self.bb = bb = model.model
         self.rank, self.group, self.device, self.L = rank, group, device, L
         self.state_bf16 = state_bf16
-        idx = [i for i in range(bb.start_layer, bb.end_layer) if is_covered(bb.layers[i])]
+        idx = [
+            i for i in range(bb.start_layer, bb.end_layer) if is_covered(bb.layers[i])
+        ]
         self.layers = {i: _Layer(i, bb.layers[i], copies) for i in idx}
-        didx = [i for i in range(bb.start_layer, bb.end_layer) if is_dsa_covered(bb.layers[i])]
+        didx = [
+            i
+            for i in range(bb.start_layer, bb.end_layer)
+            if is_dsa_covered(bb.layers[i])
+        ]
         self.dsa = {i: _DsaLayer(i, bb.layers[i], copies) for i in didx}
         eps = {ly.onorm_eps for ly in self.layers.values()}
         assert len(eps) == 1, eps
         self.onorm_eps = eps.pop()
         self.lower_bound = float(LINEAR_ATTN_CONFIG["gate_lower_bound"])
         self.last = bb.end_layer - 1
-        self.buckets = tuple(L * r for r in req_buckets() if L * r > NARROW)
+        self.buckets = tuple(L * r for r in REQ_BUCKETS if L * r > NARROW)
         self.bufs, self.runs = {}, {}
         self.kda_ready = False
         self.moe_out = moe_output_flag()
@@ -225,10 +235,24 @@ class Wide:
     def _build(self, b, kind, t1):
         from sgl_amd_mono.glm53_flash.gfx950.wide import layer as lay
 
-        body, stop = (True, "route") if kind == "kda" else (False, "agate" if kind == "a" else "route")
+        body, stop = (
+            (True, "route")
+            if kind == "kda"
+            else (False, "agate" if kind == "a" else "route")
+        )
         return lay.build(
-            b, self.L, TP, self.lower_bound, self.onorm_eps, self.state_bf16, True,
-            stop, shared_w=1.0, t1=t1, moe_sort=stop == "route", body=body,
+            b,
+            self.L,
+            TP,
+            self.lower_bound,
+            self.onorm_eps,
+            self.state_bf16,
+            True,
+            stop,
+            shared_w=1.0,
+            t1=t1,
+            moe_sort=stop == "route",
+            body=body,
         )
 
     def _kinds(self):
@@ -258,16 +282,23 @@ class Wide:
             pb = PeerBuffer(pl["peer_bytes"], self.group, self.rank, TP, dev)
             pb.bytes.zero_()
             var[kind, t1] = dict(
-                launch=launch, peers=pb,
-                epoch=z(pl["epoch_words"], dt=i32), scratch=z(pl["scratch_words"], dt=i32),
+                launch=launch,
+                peers=pb,
+                epoch=z(pl["epoch_words"], dt=i32),
+                scratch=z(pl["scratch_words"], dt=i32),
             )
 
         def out():
             return dict(
-                res_mid=z(b, HC, HIDDEN), x_f=z(b, HIDDEN), post_f=z(b, HC, dt=f32),
-                comb_f=z(b, HC * HC, dt=f32), ids=z(b, MOE_SLOTS, dt=i32),
-                wts=z(b, MOE_SLOTS, dt=f32), logits=z(b, N_EXPERTS, dt=f32),
-                moe=z(b, HIDDEN), res_cur=z(b, HC, HIDDEN),
+                res_mid=z(b, HC, HIDDEN),
+                x_f=z(b, HIDDEN),
+                post_f=z(b, HC, dt=f32),
+                comb_f=z(b, HC * HC, dt=f32),
+                ids=z(b, MOE_SLOTS, dt=i32),
+                wts=z(b, MOE_SLOTS, dt=f32),
+                logits=z(b, N_EXPERTS, dt=f32),
+                moe=z(b, HIDDEN),
+                res_cur=z(b, HC, HIDDEN),
             )
 
         R = b // self.L
@@ -276,21 +307,34 @@ class Wide:
         sbuf = torch.empty(sly["nbytes"], dtype=torch.uint8, device=dev)
         sort.init(sbuf, b)
         bufs = dict(
-            var=var, r_in=z(b, HC, HIDDEN), out=[out(), out()], sbuf=sbuf, sly=sly,
-            x_a=z(b, HIDDEN), post_a=z(b, HC, dt=f32), comb_a=z(b, HC * HC, dt=f32),
-            proj=z(b, kda.NPROJ), core=z(b, kda.P), acc_o=z(b, HIDDEN),
+            var=var,
+            r_in=z(b, HC, HIDDEN),
+            out=[out(), out()],
+            sbuf=sbuf,
+            sly=sly,
+            x_a=z(b, HIDDEN),
+            post_a=z(b, HC, dt=f32),
+            comb_a=z(b, HC * HC, dt=f32),
+            proj=z(b, kda.NPROJ),
+            core=z(b, kda.P),
+            acc_o=z(b, HIDDEN),
             slots=torch.full((R,), -1, dtype=i32, device=dev),
             iw_idx=torch.full((R,), -1, dtype=i32, device=dev),
             ring_idx=torch.full((R,), -1, dtype=i32, device=dev),
             # a DSA layer's attention input, its mixes and the streams it reads
-            dsa=dict(x=z(b, HIDDEN), post=z(b, HC, dt=f32), comb=z(b, HC * HC, dt=f32),
-                     res=z(b, HC, HIDDEN)),
+            dsa=dict(
+                x=z(b, HIDDEN),
+                post=z(b, HC, dt=f32),
+                comb=z(b, HC * HC, dt=f32),
+                res=z(b, HC, HIDDEN),
+            ),
         )
         self.bufs[b] = bufs
-        _say(
-            f"bucket {b}: peers "
-            f"{', '.join(f'{k[0]} t1={int(k[1])} {v['peers'].bytes.numel() / 1e6:.1f} MB' for k, v in var.items())}"
+        peers = ", ".join(
+            f"{k[0]} t1={int(k[1])} {v['peers'].bytes.numel() / 1e6:.1f} MB"
+            for k, v in var.items()
         )
+        _say(f"bucket {b}: peers {peers}")
         return bufs
 
     # ------------------------------------------------------------ KDA state
@@ -333,11 +377,14 @@ class Wide:
         P3 = ly.ptr_a[5].shape[0]
         want_state = torch.bfloat16 if self.state_bf16 else torch.float32
         ok = (
-            conv.dtype == torch.bfloat16 and tuple(conv.shape[1:]) == (P3, 3)
+            conv.dtype == torch.bfloat16
+            and tuple(conv.shape[1:]) == (P3, 3)
             and conv.stride(1) == 1
-            and tuple(iw.shape[1:]) == (self.L, P3, 3) and iw.stride(2) == 1
+            and tuple(iw.shape[1:]) == (self.L, P3, 3)
+            and iw.stride(2) == 1
             and state.dtype == want_state
-            and state.stride()[1:] == (state.shape[2] * state.shape[3], state.shape[3], 1)
+            and state.stride()[1:]
+            == (state.shape[2] * state.shape[3], state.shape[3], 1)
             and ring[0].shape[-2] >= self.L
             and all(t.stride(-1) == 1 for t in ring)
         )
@@ -354,26 +401,87 @@ class Wide:
     def _launch(self, ly, b, bufs, t1, prev, cur, r_in, m):
         v = bufs["var"]["kda", t1]
         conv, iw, state, rawv, rawk, g, beta = ly.cache
-        hc_fn, hc_scale, hc_base, g_norm, w_in, conv_w, w_fgb, a_log, dt_bias, on_w, w_o = (
-            ly.ptr_a
-        )
+        (
+            hc_fn,
+            hc_scale,
+            hc_base,
+            g_norm,
+            w_in,
+            conv_w,
+            w_fgb,
+            a_log,
+            dt_bias,
+            on_w,
+            w_o,
+        ) = ly.ptr_a
         sl, iwi, ri = bufs["slots"], bufs["iw_idx"], bufs["ring_idx"]
         ints = (
-            conv.stride(0), conv.stride(2), iw.stride(0), iw.stride(1), iw.stride(3),
-            rawv.stride(0), rawk.stride(0), g.stride(0), beta.stride(0), rawv.shape[-2],
+            conv.stride(0),
+            conv.stride(2),
+            iw.stride(0),
+            iw.stride(1),
+            iw.stride(3),
+            rawv.stride(0),
+            rawk.stride(0),
+            g.stride(0),
+            beta.stride(0),
+            rawv.shape[-2],
         )
         ptrs = (
-            r_in, hc_fn, hc_scale, hc_base, g_norm, bufs["x_a"], bufs["post_a"],
-            bufs["comb_a"], w_in, bufs["proj"], conv_w, conv, sl, iw, iwi, w_fgb, a_log,
-            dt_bias, state, sl, rawv, rawk, g, beta, ri, on_w, bufs["core"], w_o,
-            bufs["acc_o"], *ly.ffn, cur["res_mid"], cur["x_f"], cur["post_f"],
-            cur["comb_f"], ly.w_r, ly.bias, cur["ids"], cur["wts"], cur["logits"],
-            prev["moe"], prev["post_f"], prev["comb_f"], cur["res_cur"], v["epoch"],
+            r_in,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            g_norm,
+            bufs["x_a"],
+            bufs["post_a"],
+            bufs["comb_a"],
+            w_in,
+            bufs["proj"],
+            conv_w,
+            conv,
+            sl,
+            iw,
+            iwi,
+            w_fgb,
+            a_log,
+            dt_bias,
+            state,
+            sl,
+            rawv,
+            rawk,
+            g,
+            beta,
+            ri,
+            on_w,
+            bufs["core"],
+            w_o,
+            bufs["acc_o"],
+            *ly.ffn,
+            cur["res_mid"],
+            cur["x_f"],
+            cur["post_f"],
+            cur["comb_f"],
+            ly.w_r,
+            ly.bias,
+            cur["ids"],
+            cur["wts"],
+            cur["logits"],
+            prev["moe"],
+            prev["post_f"],
+            prev["comb_f"],
+            cur["res_cur"],
+            v["epoch"],
             v["scratch"],
         )
         v["launch"](
-            *[t.data_ptr() for t in ptrs], v["peers"].addresses.data_ptr(), self.rank,
-            *ints, bufs["sbuf"].data_ptr(), cur["moe"].data_ptr(), m,
+            *[t.data_ptr() for t in ptrs],
+            v["peers"].addresses.data_ptr(),
+            self.rank,
+            *ints,
+            bufs["sbuf"].data_ptr(),
+            cur["moe"].data_ptr(),
+            m,
             stream=torch.cuda.current_stream(),
         )
 
@@ -390,16 +498,28 @@ class Wide:
             [p(r_in), *[p(t) for t in mhc4], p(x), p(post), p(comb)]
             + [0] * 21  # in_proj, KDA, o_proj: no body
             + [0] * 8  # FFN mHC, R_mid, x_f, post_f, comb_f: no body
-            + ([p(ly.w_r), p(ly.bias), p(cur["ids"]), p(cur["wts"]), p(cur["logits"])]
-               if route else [0] * 5)
-            + [p(prev["moe"]) if t1 else 0, p(prev["post_f"]) if t1 else 0,
-               p(prev["comb_f"]) if t1 else 0, p(res)]
+            + (
+                [p(ly.w_r), p(ly.bias), p(cur["ids"]), p(cur["wts"]), p(cur["logits"])]
+                if route
+                else [0] * 5
+            )
+            + [
+                p(prev["moe"]) if t1 else 0,
+                p(prev["post_f"]) if t1 else 0,
+                p(prev["comb_f"]) if t1 else 0,
+                p(res),
+            ]
             + [p(v["epoch"]), p(v["scratch"])]
         )
         assert len(ptrs) == 48, len(ptrs)
         v["launch"](
-            *ptrs, v["peers"].addresses.data_ptr(), self.rank, *([0] * 10),
-            bufs["sbuf"].data_ptr() if route else 0, p(cur["moe"]) if route else 0, m,
+            *ptrs,
+            v["peers"].addresses.data_ptr(),
+            self.rank,
+            *([0] * 10),
+            bufs["sbuf"].data_ptr() if route else 0,
+            p(cur["moe"]) if route else 0,
+            m,
             stream=torch.cuda.current_stream(),
         )
 
@@ -415,15 +535,21 @@ class Wide:
         ctx.set_attn_inputs(AttentionInputs(x, fb, attn.prepare_qkv_latent))
         try:
             o = attn(
-                positions=positions, hidden_states=x, forward_batch=fb,
-                zero_allocator=zero_allocator, input_on_attn_tp_slices=False,
+                positions=positions,
+                hidden_states=x,
+                forward_batch=fb,
+                zero_allocator=zero_allocator,
+                input_on_attn_tp_slices=False,
                 prev_topk_indices=None,
             )
         finally:
             ctx.clear_attn_inputs()
         if isinstance(o, tuple):
             o = o[0]
-        assert o.dtype == torch.bfloat16 and o.shape == (x.shape[0], HIDDEN), (o.dtype, o.shape)
+        assert o.dtype == torch.bfloat16 and o.shape == (x.shape[0], HIDDEN), (
+            o.dtype,
+            o.shape,
+        )
         return o.contiguous()
 
     def _experts(self, ly, cur, rows, bufs):
@@ -447,9 +573,14 @@ class Wide:
         register_presorted_moe(
             dict(
                 sort.views(bufs["sbuf"], bufs["sly"], rows),
-                topk_ids_ptr=cur["ids"].data_ptr(), topk_weights_ptr=cur["wts"].data_ptr(),
-                M=rows, block_m=sort.BM, num_experts=N_EXPERTS + 1, topk=TOPK_SLOTS,
-                moe_buf_zeroed=True, moe_buf_ptr=out.data_ptr(),
+                topk_ids_ptr=cur["ids"].data_ptr(),
+                topk_weights_ptr=cur["wts"].data_ptr(),
+                M=rows,
+                block_m=sort.BM,
+                num_experts=N_EXPERTS + 1,
+                topk=TOPK_SLOTS,
+                moe_buf_zeroed=True,
+                moe_buf_ptr=out.data_ptr(),
             )
         )
         if self.moe_out:
@@ -493,8 +624,12 @@ class Wide:
                 if self.dsa:
                     dl, d = next(iter(self.dsa.values())), bufs["dsa"]
                     out4 = (d["x"], d["post"], d["comb"], d["res"])
-                    self._seam(bufs, "a", False, dl.attn, out4, bufs["r_in"], None, dl, None, b)
-                    self._seam(bufs, "a", True, dl.attn, out4, o1["res_mid"], o1, dl, None, b)
+                    self._seam(
+                        bufs, "a", False, dl.attn, out4, bufs["r_in"], None, dl, None, b
+                    )
+                    self._seam(
+                        bufs, "a", True, dl.attn, out4, o1["res_mid"], o1, dl, None, b
+                    )
                     fin = dict(moe=d["x"], post_f=d["post"], comb_f=d["comb"])
                     out4 = (o0["x_f"], o0["post_f"], o0["comb_f"], o0["res_mid"])
                     self._seam(bufs, "b", True, dl.ffn, out4, d["res"], fin, dl, o0, b)
@@ -526,11 +661,14 @@ class Wide:
         rb.start(fb)
         dev = hidden.device
         zero_allocator = BumpAllocator(
-            buffer_size=2 * (m.end_layer - m.start_layer), dtype=torch.float32, device=dev
+            buffer_size=2 * (m.end_layer - m.start_layer),
+            dtype=torch.float32,
+            device=dev,
         )
         gz = (
             BumpAllocator(
-                buffer_size=m.gemm_output_zero_allocator_size, dtype=torch.float32,
+                buffer_size=m.gemm_output_zero_allocator_size,
+                dtype=torch.float32,
                 device=dev,
             )
             if getattr(m, "gemm_output_zero_allocator_size", 0) > 0
@@ -542,7 +680,11 @@ class Wide:
         while i < m.end_layer:
             if i not in self.layers and i not in self.dsa:
                 hidden, topk_indices = m.layers[i](
-                    positions, hidden, fb, zero_allocator, gz,
+                    positions,
+                    hidden,
+                    fb,
+                    zero_allocator,
+                    gz,
                     prev_topk_indices=topk_indices,
                 )
                 i += 1
@@ -550,7 +692,9 @@ class Wide:
             # a run of covered layers, from the written streams (the first launch reads
             # SGLang's rows in place; the bucket's pad rows read 0)
             if rb.stream_of(fb).pending is not None:
-                raise RuntimeError(f"wide run at layer {i}: a residual update is still pending")
+                raise RuntimeError(
+                    f"wide run at layer {i}: a residual update is still pending"
+                )
             r0 = hidden.view(rows, HC, HIDDEN)
             if not r0.is_contiguous():
                 r0 = bufs["r_in"][:rows].copy_(r0)
@@ -569,15 +713,31 @@ class Wide:
                     # seam a, SGLang's attention, seam b (the attention's all-reduce)
                     ly = self.dsa[li]
                     self._seam(
-                        bufs, "a", n > 0, ly.attn, (d["x"], d["post"], d["comb"], d["res"]),
-                        r_in, prev, ly, None, rows,
+                        bufs,
+                        "a",
+                        n > 0,
+                        ly.attn,
+                        (d["x"], d["post"], d["comb"], d["res"]),
+                        r_in,
+                        prev,
+                        ly,
+                        None,
+                        rows,
                     )
-                    o = self._attention(ly, positions, d["x"][:rows], fb, zero_allocator)
+                    o = self._attention(
+                        ly, positions, d["x"][:rows], fb, zero_allocator
+                    )
                     self._seam(
-                        bufs, "b", True, ly.ffn,
+                        bufs,
+                        "b",
+                        True,
+                        ly.ffn,
                         (cur["x_f"], cur["post_f"], cur["comb_f"], cur["res_mid"]),
                         d["res"] if n > 0 else r_in,
-                        dict(moe=o, post_f=d["post"], comb_f=d["comb"]), ly, cur, rows,
+                        dict(moe=o, post_f=d["post"], comb_f=d["comb"]),
+                        ly,
+                        cur,
+                        rows,
                     )
                 self._experts(ly, cur, rows, bufs)
                 ping = 1 - ping
@@ -586,7 +746,9 @@ class Wide:
             o = bufs["out"][ping]
             x = tensor_model_parallel_all_reduce(o["moe"][:rows])
             hidden = last.module.hc_post(
-                x, o["res_mid"][:rows].view(rows, -1), o["comb_f"][:rows],
+                x,
+                o["res_mid"][:rows].view(rows, -1),
+                o["comb_f"][:rows],
                 o["post_f"][:rows],
             )
             if run[-1] == self.last:

@@ -45,7 +45,9 @@ def layout(b):
     ``aux_sort_capacity`` for M = b (it holds every M <= b)."""
     p = b * TOPK
     maxp = (p + min(E, p) * (BM - 1) + BM - 1) // BM * BM
-    sizes = dict(ids=4 * maxp, w=4 * maxp, eids=4 * (maxp // BM), nv=8, mi=4 * maxp, dest=4 * p)
+    sizes = dict(
+        ids=4 * maxp, w=4 * maxp, eids=4 * (maxp // BM), nv=8, mi=4 * maxp, dest=4 * p
+    )
     offs, at = {}, 0
     for k, n in sizes.items():
         offs[k] = at
@@ -137,7 +139,9 @@ def sort_rows(tid, m, ly, flags, fidx, target, ids, wts, sbuf, masks, bbl, scan)
         es.append(fx.min(fx.max(ld_i32(ids, p, CM_DEV), 0), E - 1))
         ws.append(
             fx.Float32(
-                bo.buffer_load(rsrc(wts), p, vec_width=1, dtype=T.f32, cache_modifier=CM_DEV)
+                bo.buffer_load(
+                    rsrc(wts), p, vec_width=1, dtype=T.f32, cache_modifier=CM_DEV
+                )
             )
         )
     for k in range_constexpr(pr):
@@ -145,7 +149,9 @@ def sort_rows(tid, m, ly, flags, fidx, target, ids, wts, sbuf, masks, bbl, scan)
         if p < p_n:
             t = p // TOPK
             fx.llvm.atomic_or(
-                masks + es[k] * mw + t // 32, fx.Int32(1) << (t % 32), syncscope="workgroup"
+                masks + es[k] * mw + t // 32,
+                fx.Int32(1) << (t % 32),
+                syncscope="workgroup",
             )
     gpu.barrier()
     # 3. blocks an expert (expert tid), blocks before it
@@ -176,7 +182,9 @@ def sort_rows(tid, m, ly, flags, fidx, target, ids, wts, sbuf, masks, bbl, scan)
                 lo = t - 32 * w
                 keep = (lo >= 32).select(
                     fx.Int32(-1),
-                    (lo <= 0).select(fx.Int32(0), (fx.Int32(1) << fx.max(lo, 0)) - fx.Int32(1)),
+                    (lo <= 0).select(
+                        fx.Int32(0), (fx.Int32(1) << fx.max(lo, 0)) - fx.Int32(1)
+                    ),
                 )
                 rank = rank + popcount(fx.Uint32(word & keep))
             dest = fx.ptr_load(bbl + ek) * BM + rank

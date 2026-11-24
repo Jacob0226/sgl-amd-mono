@@ -110,7 +110,12 @@ class _Built:
         self.lm, self.wide = lm, runner
 
     def forward(
-        self, plan, input_ids, positions, forward_batch, input_embeds=None,
+        self,
+        plan,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
         pp_proxy_tensors=None,
     ):
         lm = self.lm
@@ -147,7 +152,9 @@ def _build(model, hf_config, ctx):
     L = int(get_spec().speculative_num_draft_tokens)
     device = model.model.layers[0].input_layernorm.weight.device
     state_bf16 = mamba2_state_dtype(hf_config).temporal == torch.bfloat16
-    w = wide.Wide(model, p.tp_rank, p.tp_group.cpu_group, device, L, state_bf16, ctx.copies)
+    w = wide.Wide(
+        model, p.tp_rank, p.tp_group.cpu_group, device, L, state_bf16, ctx.copies
+    )
     w.warmup()
     torch.cuda.empty_cache()
     return _Built(model, w)

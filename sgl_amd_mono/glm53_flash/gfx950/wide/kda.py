@@ -51,11 +51,15 @@ assert THREADS == 2 * HALF and KD // BVC == 2
 
 
 def _load(addr, off, dtype, vec=1, cm=0):
-    return bo.buffer_load(rsrc(addr), off, vec_width=vec, dtype=dtype, cache_modifier=cm)
+    return bo.buffer_load(
+        rsrc(addr), off, vec_width=vec, dtype=dtype, cache_modifier=cm
+    )
 
 
 def _load_uniform(addr, i):
-    return fx.Int32(bo.buffer_load(rsrc(addr), i, vec_width=1, dtype=T.i32, is_scalar=True))
+    return fx.Int32(
+        bo.buffer_load(rsrc(addr), i, vec_width=1, dtype=T.i32, is_scalar=True)
+    )
 
 
 def _uniform(v):
@@ -166,7 +170,12 @@ def kda_head(c, n, hv, lds):
     gw = [
         [
             fx.Vector(
-                _load(a["w_fgb"], ((which * P + gr) * KD + (lane // 16) * 32) // 2 + 4 * q, T.i32, 4)
+                _load(
+                    a["w_fgb"],
+                    ((which * P + gr) * KD + (lane // 16) * 32) // 2 + 4 * q,
+                    T.i32,
+                    4,
+                )
             )
             for q in range(4)
         ]
@@ -186,13 +195,18 @@ def kda_head(c, n, hv, lds):
     dtb = fx.Float32(_load(a["dt_bias"], hv * KD + ch, T.f32))
     a_log = fx.Float32(_load(a["a_log"], hv, T.f32))
     state_bf16 = c["state_bf16"]
-    st_base = a["state"] + fx.Int64(fx.max(h0, 0)) * fx.Int64(NH * KD * KD * (2 if state_bf16 else 4))
+    st_base = a["state"] + fx.Int64(fx.max(h0, 0)) * fx.Int64(
+        NH * KD * KD * (2 if state_bf16 else 4)
+    )
     state_t = T.bf16 if state_bf16 else T.f32
     hs = []
     for j in range_constexpr(VPT):
         row = (hv * KD + v0 + cg + NCG * j) * KD
         hs.append(
-            [fx.Vector(_load(st_base, row + (i * KSPLIT + ks) * 4, state_t, 4)) for i in range(KG)]
+            [
+                fx.Vector(_load(st_base, row + (i * KSPLIT + ks) * 4, state_t, 4))
+                for i in range(KG)
+            ]
         )
 
     c["wait_proj"](n, hv)
@@ -203,14 +217,26 @@ def kda_head(c, n, hv, lds):
     xbs = [
         [
             fx.Vector(
-                _load(x, ((bos + t) * xs_ + col0 + (lane // 16) * 32 + 8 * q) // 2, T.i32, 4, pcm)
+                _load(
+                    x,
+                    ((bos + t) * xs_ + col0 + (lane // 16) * 32 + 8 * q) // 2,
+                    T.i32,
+                    4,
+                    pcm,
+                )
             )
             for q in range(4)
         ]
         for col0 in (FA_0, GA_0)
     ]
-    xw += [fx.BFloat16(_load(x, (bos + tt) * xs_ + qk_ch, T.bf16, 1, pcm)) for tt in range(TT)]
-    vw += [fx.BFloat16(_load(x, (bos + tt) * xs_ + v_ch, T.bf16, 1, pcm)) for tt in range(TT)]
+    xw += [
+        fx.BFloat16(_load(x, (bos + tt) * xs_ + qk_ch, T.bf16, 1, pcm))
+        for tt in range(TT)
+    ]
+    vw += [
+        fx.BFloat16(_load(x, (bos + tt) * xs_ + v_ch, T.bf16, 1, pcm))
+        for tt in range(TT)
+    ]
     b_row = bos + fx.min(ch, TT - 1)
     bb = fx.Float32(fx.BFloat16(_load(x, b_row * xs_ + BETA_0 + hv, T.bf16, 1, pcm)))
     # f_b / g_b: wave w's MFMA gives rows 16 w .. of both for the TT tokens (bf16 out)
@@ -218,13 +244,17 @@ def kda_head(c, n, hv, lds):
         gacc = fx.Vector.filled(4, 0.0, fx.Float32)
         for q in range_constexpr(4):
             gacc = mfma_bf16(
-                gw[which][q].bitcast(fx.BFloat16), xbs[which][q].bitcast(fx.BFloat16), gacc
+                gw[which][q].bitcast(fx.BFloat16),
+                xbs[which][q].bitcast(fx.BFloat16),
+                gacc,
             )
         dst = s_fa if which == 0 else s_ga
         for i in range_constexpr(4):
             kk = wave * 16 + 4 * (lane // 16) + i
             if lane % 16 < TT:
-                fx.ptr_store(fx.Float32(fx.Float32(gacc[i]).to(fx.BFloat16)), dst + (t * KD + kk))
+                fx.ptr_store(
+                    fx.Float32(fx.Float32(gacc[i]).to(fx.BFloat16)), dst + (t * KD + kk)
+                )
     gpu.barrier()
     if const_expr("stamp" in c):
         c["stamp"](9)
@@ -274,17 +304,24 @@ def kda_head(c, n, hv, lds):
 
     alive = h0 >= 0
     hsf = [
-        [alive.select(fx.Float32(hs[j][i // 4][i % 4]), fx.Float32(0.0)) for i in range(4 * KG)]
+        [
+            alive.select(fx.Float32(hs[j][i // 4][i % 4]), fx.Float32(0.0))
+            for i in range(4 * KG)
+        ]
         for j in range(VPT)
     ]
     v4 = fx.Vector.make_type(4, fx.Float32)
     beta_t = [fx.ptr_load(s_beta + tt) for tt in range(TT)]
     out = [[None] * TT for _ in range(VPT)]
     for tt in range_constexpr(TT):
-        rk = _rsq(fx.ptr_load(s_ss + (2 * TT + tt)) + fx.ptr_load(s_ss + (3 * TT + tt)) + fx.Float32(1e-6))
-        rq = _rsq(fx.ptr_load(s_ss + tt) + fx.ptr_load(s_ss + (TT + tt)) + fx.Float32(1e-6)) * fx.Float32(
-            KD**-0.5
+        rk = _rsq(
+            fx.ptr_load(s_ss + (2 * TT + tt))
+            + fx.ptr_load(s_ss + (3 * TT + tt))
+            + fx.Float32(1e-6)
         )
+        rq = _rsq(
+            fx.ptr_load(s_ss + tt) + fx.ptr_load(s_ss + (TT + tt)) + fx.Float32(1e-6)
+        ) * fx.Float32(KD**-0.5)
         d, k, q = [], [], []
         for i in range_constexpr(KG):
             off = tt * KD + (i * KSPLIT + ks) * 4
@@ -320,7 +357,9 @@ def kda_head(c, n, hv, lds):
         for tt in range_constexpr(1, TT):
             val = (ks == tt).select(out[j][tt], val)
         if ks < TT:
-            fx.ptr_store(fx.Float32(val.to(fx.BFloat16)), s_o + (ks * KD + v0 + cg + NCG * j))
+            fx.ptr_store(
+                fx.Float32(val.to(fx.BFloat16)), s_o + (ks * KD + v0 + cg + NCG * j)
+            )
     gpu.barrier()
     if const_expr("stamp" in c):
         c["stamp"](11)
@@ -332,7 +371,9 @@ def kda_head(c, n, hv, lds):
         e0 = 2 * lane
         o0 = fx.ptr_load(s_o + (tt * KD + e0))
         o1 = fx.ptr_load(s_o + (tt * KD + e0 + 1))
-        rstd = _rsq(butterfly(o0 * o0 + o1 * o1, (32, 16, 8, 4, 2, 1)) * (1.0 / KD) + eps)
+        rstd = _rsq(
+            butterfly(o0 * o0 + o1 * o1, (32, 16, 8, 4, 2, 1)) * (1.0 / KD) + eps
+        )
         won = fx.Vector(_load(a["on_w"], e0, T.f32, 2))
         y = [
             o * rstd * won[e] * _sigmoid(fx.ptr_load(s_ga + (tt * KD + e0 + e)))
@@ -341,7 +382,9 @@ def kda_head(c, n, hv, lds):
         y = [live.select(v, fx.Float32(0.0)) for v in y]
         if wave + tt0 < TT:
             bo.buffer_store(
-                fx.Vector.from_elements(y, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0],
+                fx.Vector.from_elements(y, fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32)[0],
                 core_out,
                 ((bos + tt) * P + hv * KD + e0) // 2,
                 cache_modifier=out_cm,
@@ -375,11 +418,15 @@ def kda_head(c, n, hv, lds):
         if iw_ok & qk_owner:
             for tt in range_constexpr(TT):
                 for j in range_constexpr(3):
-                    bo.buffer_store(xw[tt + 1 + j], rsrc(iw_base), tt * iw_step + qk_ch + j * iw_win)
+                    bo.buffer_store(
+                        xw[tt + 1 + j], rsrc(iw_base), tt * iw_step + qk_ch + j * iw_win
+                    )
         if iw_ok & has_v:
             for tt in range_constexpr(TT):
                 for j in range_constexpr(3):
-                    bo.buffer_store(vw[tt + 1 + j], rsrc(iw_base), tt * iw_step + v_ch + j * iw_win)
+                    bo.buffer_store(
+                        vw[tt + 1 + j], rsrc(iw_base), tt * iw_step + v_ch + j * iw_win
+                    )
     gpu.barrier()
     if const_expr("stamp" in c):
         c["stamp"](12)
@@ -390,11 +437,37 @@ SOURCES = kernel_sources(__name__)
 _BUILDS: dict = {}
 
 ARGS = (
-    "proj", "conv_w", "conv_st", "cs_idx", "iw", "iw_idx", "w_fgb", "a_log", "dt_bias",
-    "state", "h0_idx", "rawv", "rawk", "ring_g", "ring_beta", "ring_idx", "on_w", "core_out",
+    "proj",
+    "conv_w",
+    "conv_st",
+    "cs_idx",
+    "iw",
+    "iw_idx",
+    "w_fgb",
+    "a_log",
+    "dt_bias",
+    "state",
+    "h0_idx",
+    "rawv",
+    "rawk",
+    "ring_g",
+    "ring_beta",
+    "ring_idx",
+    "on_w",
+    "core_out",
 )
-IARGS = ("cs_line", "cs_tok", "iw_line", "iw_step", "iw_win", "rawv_slot", "rawk_slot",
-         "g_slot", "beta_slot", "ring_len")
+IARGS = (
+    "cs_line",
+    "cs_tok",
+    "iw_line",
+    "iw_step",
+    "iw_win",
+    "rawv_slot",
+    "rawk_slot",
+    "g_slot",
+    "beta_slot",
+    "ring_len",
+)
 
 
 def standalone(reqs, tt, lower_bound, onorm_eps, state_bf16, has_iw):
@@ -417,39 +490,150 @@ def standalone(reqs, tt, lower_bound, onorm_eps, state_bf16, has_iw):
         a = dict(zip(ARGS, ptrs))
         a.update(zip(IARGS, ints))
         c = dict(
-            TT=tt, tid=tid, args=a, lower_bound=lower_bound, onorm_eps=onorm_eps,
-            state_bf16=state_bf16, has_iw=has_iw, wait_proj=lambda n, hv: None,
+            TT=tt,
+            tid=tid,
+            args=a,
+            lower_bound=lower_bound,
+            onorm_eps=onorm_eps,
+            state_bf16=state_bf16,
+            has_iw=has_iw,
+            wait_proj=lambda n, hv: None,
         )
         b = fx.block_idx.x
         kda_head(c, b // NH, b % NH, lds)
 
-    @flyc.kernel(name=f"g53w_kda_r{reqs}_t{tt}_s{int(state_bf16)}_iw{int(has_iw)}",
-                 known_block_size=[THREADS, 1, 1])
-    def kernel(proj: I64, conv_w: I64, conv_st: I64, cs_idx: I64, iw: I64, iw_idx: I64,
-               w_fgb: I64, a_log: I64, dt_bias: I64, state: I64, h0_idx: I64, rawv: I64,
-               rawk: I64, ring_g: I64, ring_beta: I64, ring_idx: I64, on_w: I64,
-               core_out: I64, cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32,
-               iw_win: I32, rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32,
-               ring_len: I32):
+    @flyc.kernel(
+        name=f"g53w_kda_r{reqs}_t{tt}_s{int(state_bf16)}_iw{int(has_iw)}",
+        known_block_size=[THREADS, 1, 1],
+    )
+    def kernel(
+        proj: I64,
+        conv_w: I64,
+        conv_st: I64,
+        cs_idx: I64,
+        iw: I64,
+        iw_idx: I64,
+        w_fgb: I64,
+        a_log: I64,
+        dt_bias: I64,
+        state: I64,
+        h0_idx: I64,
+        rawv: I64,
+        rawk: I64,
+        ring_g: I64,
+        ring_beta: I64,
+        ring_idx: I64,
+        on_w: I64,
+        core_out: I64,
+        cs_line: I32,
+        cs_tok: I32,
+        iw_line: I32,
+        iw_step: I32,
+        iw_win: I32,
+        rawv_slot: I32,
+        rawk_slot: I32,
+        g_slot: I32,
+        beta_slot: I32,
+        ring_len: I32,
+    ):
         body(
-            (proj, conv_w, conv_st, cs_idx, iw, iw_idx, w_fgb, a_log, dt_bias, state, h0_idx,
-             rawv, rawk, ring_g, ring_beta, ring_idx, on_w, core_out),
-            (cs_line, cs_tok, iw_line, iw_step, iw_win, rawv_slot, rawk_slot, g_slot,
-             beta_slot, ring_len),
+            (
+                proj,
+                conv_w,
+                conv_st,
+                cs_idx,
+                iw,
+                iw_idx,
+                w_fgb,
+                a_log,
+                dt_bias,
+                state,
+                h0_idx,
+                rawv,
+                rawk,
+                ring_g,
+                ring_beta,
+                ring_idx,
+                on_w,
+                core_out,
+            ),
+            (
+                cs_line,
+                cs_tok,
+                iw_line,
+                iw_step,
+                iw_win,
+                rawv_slot,
+                rawk_slot,
+                g_slot,
+                beta_slot,
+                ring_len,
+            ),
         )
 
     @flyc.jit
-    def launch(proj: I64, conv_w: I64, conv_st: I64, cs_idx: I64, iw: I64, iw_idx: I64,
-               w_fgb: I64, a_log: I64, dt_bias: I64, state: I64, h0_idx: I64, rawv: I64,
-               rawk: I64, ring_g: I64, ring_beta: I64, ring_idx: I64, on_w: I64,
-               core_out: I64, cs_line: I32, cs_tok: I32, iw_line: I32, iw_step: I32,
-               iw_win: I32, rawv_slot: I32, rawk_slot: I32, g_slot: I32, beta_slot: I32,
-               ring_len: I32, stream: fx.Stream = fx.Stream(None)):  # noqa: B008
+    def launch(
+        proj: I64,
+        conv_w: I64,
+        conv_st: I64,
+        cs_idx: I64,
+        iw: I64,
+        iw_idx: I64,
+        w_fgb: I64,
+        a_log: I64,
+        dt_bias: I64,
+        state: I64,
+        h0_idx: I64,
+        rawv: I64,
+        rawk: I64,
+        ring_g: I64,
+        ring_beta: I64,
+        ring_idx: I64,
+        on_w: I64,
+        core_out: I64,
+        cs_line: I32,
+        cs_tok: I32,
+        iw_line: I32,
+        iw_step: I32,
+        iw_win: I32,
+        rawv_slot: I32,
+        rawk_slot: I32,
+        g_slot: I32,
+        beta_slot: I32,
+        ring_len: I32,
+        stream: fx.Stream = fx.Stream(None),
+    ):  # noqa: B008
         _ = keyed
-        kernel(proj, conv_w, conv_st, cs_idx, iw, iw_idx, w_fgb, a_log, dt_bias, state,
-               h0_idx, rawv, rawk, ring_g, ring_beta, ring_idx, on_w, core_out, cs_line,
-               cs_tok, iw_line, iw_step, iw_win, rawv_slot, rawk_slot, g_slot, beta_slot,
-               ring_len).launch(grid=(reqs * NH, 1, 1), block=(THREADS,), stream=stream)
+        kernel(
+            proj,
+            conv_w,
+            conv_st,
+            cs_idx,
+            iw,
+            iw_idx,
+            w_fgb,
+            a_log,
+            dt_bias,
+            state,
+            h0_idx,
+            rawv,
+            rawk,
+            ring_g,
+            ring_beta,
+            ring_idx,
+            on_w,
+            core_out,
+            cs_line,
+            cs_tok,
+            iw_line,
+            iw_step,
+            iw_win,
+            rawv_slot,
+            rawk_slot,
+            g_slot,
+            beta_slot,
+            ring_len,
+        ).launch(grid=(reqs * NH, 1, 1), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = launch
     return launch
