@@ -21,7 +21,6 @@ from types import SimpleNamespace
 import requests
 import torch
 from glm53_flash_server import ARGS, BF16_STATE, ENV, MODEL, MTP
-from sglang.kernels.plugin_kernels.amd.spec import FLAG
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -43,12 +42,6 @@ KL_BOUND = 0.06
 # MTP (3 draft tokens) accepts about 3.3 tokens a step on this GSM8K run at TP4;
 # the bound is for gross failures
 MTP_ACCEPT_BOUND = 2.5
-EAGER = [
-    "--cuda-graph-backend-decode",
-    "disabled",
-    "--cuda-graph-backend-prefill",
-    "disabled",
-]
 
 
 def _launch(extra_env=None, extra_args=(), log=None):
@@ -57,7 +50,7 @@ def _launch(extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + [FLAG, *extra_args],
+        other_args=ARGS + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )
@@ -144,7 +137,13 @@ class TestMonokernelMtpEager(CustomTestCase):
         # the row for each of the request's rows (a graph replays unchecked). 4
         # requests of 2 to 11 pages, so the rows differ between requests
         para = "The river valley archive lists the flood height of every year. "
-        process = _launch(extra_args=[*MTP, *EAGER])
+        process = _launch(
+            extra_args=[
+                *MTP,
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
+            ]
+        )
         try:
             r = requests.post(
                 DEFAULT_URL_FOR_TEST + "/generate",
@@ -175,7 +174,11 @@ def _check_numerics(test, extra_args=()):
     ):
         process = _launch(
             extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
-            extra_args=[*EAGER, *extra_args],
+            extra_args=[
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
+                *extra_args,
+            ],
             log=(out, err),
         )
         try:
