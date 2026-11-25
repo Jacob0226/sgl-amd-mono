@@ -254,11 +254,8 @@ def main():
                         torch.cuda.current_stream(),
                     )
 
-                line += (
-                    f"  sgl bmm+verify {bench(lambda _w: (
-                            sgl()
-                        ), [None] * 4):6.1f} us (+ o_norm)"
-                )
+                us = bench(lambda _w: sgl(), [None] * 4)
+                line += f"  sgl bmm+verify {us:6.1f} us (+ o_norm)"
             print(line, flush=True)
     print("PASS" if worst < 2e-2 else "FAIL", f"worst rel {worst:.1e}")
 
