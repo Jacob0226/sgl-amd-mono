@@ -7,7 +7,9 @@ verify steps that check each request's page-table row is repeated; the tokens of
 covered steps scored again by the normal prefill path (KL consistency); each layer's launch against SGLang's own
 layer, and the tail's logits against SGLang's, under SGLANG_AMD_MONO_CHECK; on a
 bf16 KDA state (``--mamba-ssm-dtype bfloat16``), MTP's GSM8K and accept length and
-the SGLANG_AMD_MONO_CHECK layers; the hidden states a covered step returns; and a
+the SGLANG_AMD_MONO_CHECK layers; with ReplaySSM's spec mode, MTP5 verify steps of 3 to 8
+requests (18 to 48 rows) on the wide launch (GSM8K and the accept length of those
+steps); the hidden states a covered step returns; and a
 fault on one rank that stops the server before any token of the failed step is
 sent."""
 
@@ -20,7 +22,14 @@ from types import SimpleNamespace
 
 import requests
 import torch
-from glm53_flash_server import ARGS, BF16_STATE, ENV, MODEL, MTP
+from glm53_flash_server import (
+    ARGS,
+    BF16_STATE,
+    ENV,
+    MODEL,
+    MTP,
+    WIDE_MTP,
+)
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -32,6 +41,8 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
+from sgl_amd_mono.glm53_flash import wide
+
 LAUNCH_TIMEOUT = 3600
 # The normal path scores about 0.97 on GSM8K (thinking on); the bound is for gross
 # failures
@@ -42,6 +53,9 @@ KL_BOUND = 0.06
 # MTP (3 draft tokens) accepts about 3.3 tokens a step on this GSM8K run at TP4;
 # the bound is for gross failures
 MTP_ACCEPT_BOUND = 2.5
+# MTP5 (6 draft tokens) accepts about 3.7 tokens a step on GSM8K at TP4; the bound
+# is for gross failures
+WIDE_ACCEPT_BOUND = 3.0
 
 
 def _launch(extra_env=None, extra_args=(), log=None):
@@ -242,6 +256,44 @@ class TestMonokernelBf16State(CustomTestCase):
 
     def test_each_covered_layer_within_its_numerics(self):
         _check_numerics(self, BF16_STATE)
+
+
+class TestMonokernelWide(CustomTestCase):
+    # --enable-linear-replayssm-spec: the wide launch replaces the narrow ones
+    def test_gsm8k_and_accept_length_on_the_wide_launch(self):
+        # 8 requests at a time: verify steps of 3 to 8 requests (18 to 48 rows) run
+        # the wide launch. A verify row that reads the wrong ReplaySSM ring entry or
+        # keys of its draft chain lowers the accept length before the score
+        with (
+            tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
+            tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
+        ):
+            process = _launch(
+                extra_args=[*WIDE_MTP, "--watchdog-timeout", "1200"],
+                log=(out, err),
+            )
+            try:
+                metrics = _gsm8k(threads=8)
+            finally:
+                terminate_and_kill_process_tree(process)
+            err.seek(0)
+            out.seek(0)
+            log = err.read() + out.read()
+        # Each decode log line covers 40 steps. The run's last question or two
+        # decode alone on SGLang's path for many lines, so the accept length is
+        # taken from the lines with enough requests for the wide launch only
+        logs = re.findall(
+            r"Decode batch.*?#running-req: (\d+).*?accept len: ([\d.]+)", log
+        )
+        on_wide = [float(a) for n, a in logs if int(n) >= min(wide.REQ_BUCKETS)]
+        accept = sum(on_wide) / max(len(on_wide), 1)
+        print(
+            f"{metrics=} wide accept {accept:.3f} over {len(on_wide)} of {len(logs)} logs"
+        )
+        self.assertIn("[glm53 wide]", log)
+        self.assertGreaterEqual(len(on_wide), 20)
+        self.assertGreater(metrics["score"], GSM8K_BOUND)
+        self.assertGreater(accept, WIDE_ACCEPT_BOUND)
 
 
 def _lm_head() -> torch.Tensor:
