@@ -2,8 +2,9 @@
 
 A PR runs the entries whose ``packages`` it touches; a change to ``common/``,
 ``sgl_amd_mono/__init__.py`` or ``pyproject.toml`` runs all of them. The nightly
-runs the entries marked ``nightly`` on main, and the weekly run (Saturdays)
-those and the ones marked ``weekly``. Each entry
+runs the entries marked ``nightly`` on main (those the PR test runs at the tests
+tier, see ``nightly_tier``), and the weekly run (Saturdays) those and the ones
+marked ``weekly``, all in full. Each entry
 names the server its accuracy and speed tests launch (a recipe module under
 ``test/e2e`` and its argument list, or ``env`` / ``args`` given here), the
 checkpoints on the CI nodes, its kernel and serving tests, its kernel-only
@@ -69,7 +70,7 @@ SHARED_PATHS = ("sgl_amd_mono/common/", "sgl_amd_mono/__init__.py", "pyproject.t
 
 # A PR whose own package code changes in more models than this (a refactor or an
 # API move across packages) runs each of them at the smoke tier, not the full one:
-# 14 full-tier jobs hold both GPU runners for most of a day. The nightly runs them
+# 14 full-tier jobs hold both GPU runners for most of a day. The weekly run runs them
 # all in full; a maintainer can dispatch the PR test with `models` for a full run.
 FULL_TIER_MAX_MODELS = 3
 
@@ -82,9 +83,10 @@ ISL, OSL, RANGE_RATIO, PROMPTS_PER_SLOT = 8192, 1024, 0.8, 10
 # are compared question by question (exact McNemar test), and a significant loss
 # with the monokernels on fails. The others have too few questions to gate on;
 # a score more than ``warn`` below the off run's is a warning. A PR runs GSM8K
-# (and GPQA with the `run-ci-extra` label); the nightly runs the model's benchmarks but the ``weekly`` ones, and the
+# (and GPQA with the `run-ci-extra` label); a model the nightly runs in full (none
+# today: ``nightly_tier``) gets its benchmarks but the ``weekly`` ones, and the
 # weekly run (Saturdays) runs all of them. AIME26 x4 is the costliest (~23K tokens
-# an answer), and GPQA covers much the same ground every night.
+# an answer).
 EVALS = {
     # max tokens: room for a thinking model's whole answer. Repeats are explicit:
     # sgl-eval's own defaults are 8 for GPQA and 16 for AIME.
@@ -118,6 +120,20 @@ def weekly_eval(model: dict, name: str) -> bool:
     ``weekly`` benchmark, or one the model's ``weekly_evals`` lists (a benchmark
     too slow for the nightly at the model's concurrency)."""
     return bool(EVALS[name].get("weekly")) or name in model.get("weekly_evals", ())
+
+
+def nightly_tier(model: dict) -> str:
+    """The tier a ``nightly`` model runs at in the nightly. The PR test runs a model's
+    accuracy benchmark and speed test on every change to its package (a model
+    without ``"pr": False``), so its numbers on main change only through a tested
+    PR; between PRs only the SGLang image changes, and the model's tests, serving
+    tests and the pinned sgl-amd-mono check catch that the day it does. Such a
+    model runs the nightly at the tests tier (quick kernel widths, no benchmark or
+    speed test) and its benchmarks, speed test and full kernel widths in the weekly
+    run. A model the PR test does not run would run the nightly in full. A model
+    the PR test runs that is not marked ``nightly`` (GLM-5.3-Flash, Qwen3.5) gets
+    the image check only in the weekly run."""
+    return "tests" if model.get("pr", True) else "full"
 
 
 # One-sided significance level of the GSM8K test.
@@ -257,8 +273,8 @@ MODELS = {
     },
     "glm53_flash": {
         "name": "GLM-5.3-Flash",
-        # Phase 1 of the nightly
-        "nightly": True,
+        # the weekly run (Saturdays) only: the PR test covers every change to it
+        "weekly": True,
         # set from the first weekly report
         "baseline": {},
         "packages": ["glm53_flash"],
@@ -276,13 +292,10 @@ MODELS = {
     },
     "kimi_k3": {
         "name": "Kimi-K3",
-        # Deprecated on InferenceX (Kimi-K3.1-Pro replaced it): not in the PR test;
-        # the nightly still runs it, and a kimi_k3 package change runs kimi_k31.
+        # Deprecated on InferenceX (Kimi-K3.1-Pro replaced it): not in the PR test
+        # (a kimi_k3 package change runs kimi_k31), the nightly or the weekly run.
+        # A dispatch with models=kimi_k3 still runs it.
         "pr": False,
-        # Phase 1 of the nightly
-        "nightly": True,
-        # set from the first weekly report
-        "baseline": {},
         "packages": ["kimi_k3"],
         "tp": 8,
         "paths": {
@@ -310,6 +323,9 @@ MODELS = {
     },
     "kimi_k31": {
         "name": "Kimi-K3.1",
+        # the weekly run (Saturdays): its unit, kernel and timing tests until it
+        # has a checkpoint and a serving recipe
+        "weekly": True,
         "packages": ["kimi_k31", "kimi_k3"],
         "tp": 8,
         # moonshotai/Kimi-K3.1; not on the CI nodes yet, and no serving recipe
@@ -350,6 +366,9 @@ MODELS = {
     },
     "minimax_m31": {
         "name": "MiniMax-M3.1-Flash",
+        # the weekly run (Saturdays): its unit and kernel tests (no MI355X launches
+        # to serve yet)
+        "weekly": True,
         "packages": ["minimax_m31", "minimax"],
         "tp": 4,
         # the launches cover MI350X only; the CI nodes are MI355X
@@ -407,6 +426,9 @@ MODELS = {
     },
     "muse_spark": {
         "name": "Muse-Spark",
+        # the weekly run (Saturdays): its unit and kernel tests until it has a
+        # serving recipe
+        "weekly": True,
         "packages": ["muse_spark"],
         "tp": 8,
         # no serving recipe under test/e2e yet
@@ -441,15 +463,17 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["checkpoints"]:
         print("\n".join(CHECKPOINTS))
     # `python3 models.py nightly|weekly`: the run's matrix, as JSON. The weekly run
-    # has the nightly's models and those marked ``weekly`` (weekly run only).
+    # has the nightly's models and those marked ``weekly`` (weekly run only), all
+    # in full; the nightly runs each model at its ``nightly_tier``.
     elif sys.argv[1:] in (["nightly"], ["weekly"]):
         import json
 
-        keys = ["common"] + [
-            k
+        weekly = sys.argv[1] == "weekly"
+        matrix = [{"model": "common", "tier": "full"}] + [
+            {"model": k, "tier": "full" if weekly else nightly_tier(m)}
             for k, m in MODELS.items()
-            if m.get("nightly") or (sys.argv[1] == "weekly" and m.get("weekly"))
+            if m.get("nightly") or (weekly and m.get("weekly"))
         ]
-        print(json.dumps([{"model": k, "tier": "full"} for k in keys]))
+        print(json.dumps(matrix))
     else:
         sys.exit("usage: models.py paths MODEL | checkpoints | nightly | weekly")
