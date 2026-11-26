@@ -249,7 +249,10 @@ MODELS = {
         # into both nodes' mirror
         "paths": {"GLM_53_FLASH_MODEL_PATH": f"{HF}/amd/GLM-5.3-Flash-Quark-MXFP4"},
         "recipe": ("glm53_flash_server", "ARGS"),
-        "kernel_tests": ["test/kernels/test_glm53_flash_kernels.py"],
+        "kernel_tests": [
+            "test/kernels/test_glm53_flash_kernels.py",
+            "test/kernels/test_glm53_flash_wide_kernels.py",
+        ],
         "e2e_tests": ["test/e2e/test_glm53_flash_server.py"],
         "microbench": [
             "torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8"

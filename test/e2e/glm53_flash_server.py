@@ -1,6 +1,6 @@
 """The GLM-5.3-Flash servers that the monokernel serving test launches: MI35x, TP4,
-decode steps, with ``MTP`` the NextN draft's verify steps, and with ``BF16_STATE``
-a bf16 KDA state."""
+decode steps, with ``MTP`` the NextN draft's verify steps, with ``BF16_STATE``
+a bf16 KDA state, and with ``WIDE_ENV`` and ``WIDE_MTP`` the wide verify launch."""
 
 import os
 
@@ -56,3 +56,18 @@ MTP = [
 # The KDA state pool in bf16 (f32 without it). SGLang's HIP prefill takes a bf16
 # state with sgl-project/sglang#49036; without it, its Triton prefill runs
 BF16_STATE = ["--mamba-ssm-dtype", "bfloat16"]
+# The wide spec instead of the narrow one: MTP with one draft chain of 6 tokens on
+# SGLang's ReplaySSM ring, so verify steps of 3 to 32 requests (18 to 192 rows) run
+# the wide launch and narrower ones SGLang's path
+WIDE_ENV = {"SGLANG_AMD_MONO_GLM53_FLASH_WIDE": "1"}
+WIDE_MTP = [
+    "--speculative-algorithm",
+    "EAGLE",
+    "--speculative-num-steps",
+    "5",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "6",
+    "--enable-linear-replayssm-spec",
+]
